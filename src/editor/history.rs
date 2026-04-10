@@ -103,4 +103,8 @@ impl History {
         self.snapshots.clear();
         self.current_index = 0;
     }
+    
+    pub fn is_at_start(&self) -> bool {
+        self.current_index == 0 || self.snapshots.is_empty()
+    }
 }

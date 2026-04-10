@@ -1,6 +1,7 @@
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, HeaderBar, Box, Button,
-           Orientation, Paned, Label, Statusbar, Notebook, ScrolledWindow, CheckButton};
+           Orientation, Paned, Label, Statusbar, Notebook, ScrolledWindow, CheckButton,
+           Separator, ToggleButton, Viewport};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,14 +11,18 @@ use crate::pak::PakFile;
 use crate::pak::Resource;
 use crate::ui::resource_list::ResourceList;
 use crate::ui::editor_canvas::EditorCanvas;
+use crate::ui::tool_panel::ToolPanel;
 use crate::browser_detector::{detect_browsers, get_pak_display_name};
+use crate::image_processor::optimizer::encode_png;
 
 /// Data for a single pak file tab
 struct PakTab {
-    pak_file: PakFile,
+    pak_file: RefCell<PakFile>,
     path: PathBuf,
     resource_list: Rc<ResourceList>,
     editor_canvas: Rc<EditorCanvas>,
+    tool_panel: Rc<ToolPanel>,
+    current_resource_id: RefCell<Option<u16>>,
 }
 
 pub struct MainWindow {
@@ -28,6 +33,11 @@ pub struct MainWindow {
     current_file_label: Label,
     tab_counter: RefCell<u32>,
     self_weak: RefCell<std::rc::Weak<Self>>,
+    // Bottom toolbar buttons
+    save_btn: RefCell<Option<Button>>,
+    export_btn: RefCell<Option<Button>>,
+    undo_btn: RefCell<Option<Button>>,
+    redo_btn: RefCell<Option<Button>>,
 }
 
 impl MainWindow {
@@ -48,8 +58,27 @@ impl MainWindow {
 
         header.pack_start(&scan_brave_btn);
 
-        let current_file_label = Label::new(Some("No file opened"));
+        let current_file_label = Label::builder()
+            .label("No file opened")
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .max_width_chars(40)
+            .width_chars(40)
+            .build();
         header.set_title_widget(Some(&current_file_label));
+
+        // Save button (initially disabled)
+        let save_btn = Button::builder()
+            .label("Save")
+            .sensitive(false)
+            .build();
+        header.pack_end(&save_btn);
+
+        // Export button (initially disabled)
+        let export_btn = Button::builder()
+            .label("Export to Brave")
+            .sensitive(false)
+            .build();
+        header.pack_end(&export_btn);
 
         window.set_titlebar(Some(&header));
 
@@ -60,6 +89,40 @@ impl MainWindow {
         let notebook = Notebook::new();
         notebook.set_vexpand(true);
         main_box.append(&notebook);
+
+        // Bottom toolbar
+        let bottom_toolbar = Box::new(Orientation::Horizontal, 8);
+        bottom_toolbar.set_margin_top(6);
+        bottom_toolbar.set_margin_bottom(6);
+        bottom_toolbar.set_margin_start(12);
+        bottom_toolbar.set_margin_end(12);
+
+        // Undo/Redo buttons
+        let undo_btn = Button::from_icon_name("edit-undo-symbolic");
+        undo_btn.set_tooltip_text(Some("Undo"));
+        undo_btn.set_sensitive(false);
+
+        let redo_btn = Button::from_icon_name("edit-redo-symbolic");
+        redo_btn.set_tooltip_text(Some("Redo"));
+        redo_btn.set_sensitive(false);
+
+        bottom_toolbar.append(&undo_btn);
+        bottom_toolbar.append(&redo_btn);
+        bottom_toolbar.append(&Separator::new(Orientation::Vertical));
+
+        // Tool size indicator
+        let size_label = Label::new(Some("Tool Size: 8px"));
+        bottom_toolbar.append(&size_label);
+
+        bottom_toolbar.append(&Separator::new(Orientation::Vertical));
+
+        // Status label
+        let status_label = Label::new(Some("No changes"));
+        status_label.set_hexpand(true);
+        status_label.set_halign(gtk4::Align::Start);
+        bottom_toolbar.append(&status_label);
+
+        main_box.append(&bottom_toolbar);
 
         // Status bar
         let status_bar = Statusbar::new();
@@ -76,6 +139,10 @@ impl MainWindow {
             current_file_label,
             tab_counter: RefCell::new(0),
             self_weak: RefCell::new(std::rc::Weak::new()),
+            save_btn: RefCell::new(Some(save_btn)),
+            export_btn: RefCell::new(Some(export_btn)),
+            undo_btn: RefCell::new(Some(undo_btn)),
+            redo_btn: RefCell::new(Some(redo_btn)),
         });
 
         // Set up self-referential weak pointer
@@ -89,7 +156,7 @@ impl MainWindow {
 
     fn setup_signals(this: &Rc<Self>, scan_brave_btn: &Button) {
         println!("[DEBUG] Setting up signals...");
-        
+
         // Scan Brave button
         let this_weak = this.self_weak.borrow().clone();
         scan_brave_btn.connect_clicked(move |_btn| {
@@ -107,6 +174,152 @@ impl MainWindow {
                 this.on_tab_switched(page_num);
             }
         });
+
+        // Setup bottom toolbar button handlers
+        Self::setup_toolbar_signals(this);
+    }
+
+    fn setup_toolbar_signals(this: &Rc<Self>) {
+        // Undo button
+        if let Some(ref undo_btn) = *this.undo_btn.borrow() {
+            let this_weak = this.self_weak.borrow().clone();
+            undo_btn.connect_clicked(move |_btn| {
+                if let Some(this) = this_weak.upgrade() {
+                    this.on_undo_clicked();
+                }
+            });
+        }
+
+        // Redo button
+        if let Some(ref redo_btn) = *this.redo_btn.borrow() {
+            let this_weak = this.self_weak.borrow().clone();
+            redo_btn.connect_clicked(move |_btn| {
+                if let Some(this) = this_weak.upgrade() {
+                    this.on_redo_clicked();
+                }
+            });
+        }
+
+        // Save button
+        if let Some(ref save_btn) = *this.save_btn.borrow() {
+            let this_weak = this.self_weak.borrow().clone();
+            save_btn.connect_clicked(move |_btn| {
+                if let Some(this) = this_weak.upgrade() {
+                    this.on_save_clicked();
+                }
+            });
+        }
+
+        // Export button
+        if let Some(ref export_btn) = *this.export_btn.borrow() {
+            let this_weak = this.self_weak.borrow().clone();
+            export_btn.connect_clicked(move |_btn| {
+                if let Some(this) = this_weak.upgrade() {
+                    this.on_export_clicked();
+                }
+            });
+        }
+    }
+
+    fn on_undo_clicked(&self) {
+        let current_page = self.notebook.current_page();
+        if let Some(page_num) = current_page {
+            let tabs = self.tabs.borrow();
+            if let Some(tab) = tabs.get(&page_num) {
+                tab.editor_canvas.undo();
+                self.update_toolbar_buttons(&tab);
+            }
+        }
+    }
+
+    fn on_redo_clicked(&self) {
+        let current_page = self.notebook.current_page();
+        if let Some(page_num) = current_page {
+            let tabs = self.tabs.borrow();
+            if let Some(tab) = tabs.get(&page_num) {
+                tab.editor_canvas.redo();
+                self.update_toolbar_buttons(&tab);
+            }
+        }
+    }
+
+    fn on_save_clicked(&self) {
+        let current_page = self.notebook.current_page();
+        if let Some(page_num) = current_page {
+            let tabs = self.tabs.borrow();
+            if let Some(tab) = tabs.get(&page_num) {
+                self.save_current_resource(tab);
+            }
+        }
+    }
+
+    fn on_export_clicked(&self) {
+        let current_page = self.notebook.current_page();
+        if let Some(page_num) = current_page {
+            let tabs = self.tabs.borrow();
+            if let Some(tab) = tabs.get(&page_num) {
+                self.export_to_brave(tab);
+            }
+        }
+    }
+
+    fn save_current_resource(&self, tab: &PakTab) {
+        if let Some(resource_id) = *tab.current_resource_id.borrow() {
+            if let Some(image) = tab.editor_canvas.get_composite_image() {
+                match encode_png(&image, 6) {
+                    Ok(png_data) => {
+                        // Update the pak file
+                        let mut pak = tab.pak_file.borrow_mut();
+                        if let Err(e) = pak.replace_resource(resource_id, png_data) {
+                            self.show_error_dialog("Save Error", &format!("Failed to update resource: {}", e));
+                            return;
+                        }
+                        // Clear changes flag
+                        tab.editor_canvas.clear_changes();
+                        self.update_toolbar_buttons(tab);
+                        self.status_bar.push(0, &format!("Saved changes to resource {}", resource_id));
+                    }
+                    Err(e) => {
+                        self.show_error_dialog("Export Error", &format!("Failed to encode PNG: {}", e));
+                    }
+                }
+            }
+        }
+    }
+
+    fn export_to_brave(&self, tab: &PakTab) {
+        // First save the current resource
+        self.save_current_resource(tab);
+
+        // Then write the pak file back to the original path
+        let pak = tab.pak_file.borrow();
+        match pak.save(&tab.path) {
+            Ok(_) => {
+                self.status_bar.push(0, &format!("Exported to Brave: {}", tab.path.display()));
+            }
+            Err(e) => {
+                self.show_error_dialog("Export Error", &format!("Failed to write pak file: {}", e));
+            }
+        }
+    }
+
+    fn update_toolbar_buttons(&self, tab: &PakTab) {
+        let has_changes = tab.editor_canvas.has_changes();
+        let can_undo = tab.editor_canvas.can_undo();
+        let can_redo = tab.editor_canvas.can_redo();
+
+        if let Some(ref save_btn) = *self.save_btn.borrow() {
+            save_btn.set_sensitive(has_changes);
+        }
+        if let Some(ref export_btn) = *self.export_btn.borrow() {
+            export_btn.set_sensitive(has_changes);
+        }
+        if let Some(ref undo_btn) = *self.undo_btn.borrow() {
+            undo_btn.set_sensitive(can_undo);
+        }
+        if let Some(ref redo_btn) = *self.redo_btn.borrow() {
+            redo_btn.set_sensitive(can_redo);
+        }
     }
 
     fn show_file_browser(&self) {
@@ -271,13 +484,24 @@ impl MainWindow {
         resource_list.set_resources(pak.get_image_resources().into_iter().cloned().collect());
 
         let editor_canvas = Rc::new(EditorCanvas::new());
+        let tool_panel = Rc::new(ToolPanel::new());
+        tool_panel.set_editor_canvas(Rc::clone(&editor_canvas));
 
-        let paned = Paned::new(Orientation::Horizontal);
-        paned.set_wide_handle(true);
-        paned.set_vexpand(true);
-        paned.set_start_child(Some(resource_list.widget()));
-        paned.set_end_child(Some(editor_canvas.widget()));
-        paned.set_position(300);
+        // Create a 3-pane layout: resource list | editor | tool panel
+        let main_paned = Paned::new(Orientation::Horizontal);
+        main_paned.set_wide_handle(true);
+        main_paned.set_vexpand(true);
+        main_paned.set_position(250);
+
+        // Right side: editor + tool panel
+        let right_paned = Paned::new(Orientation::Horizontal);
+        right_paned.set_wide_handle(true);
+        right_paned.set_position(800);
+        right_paned.set_start_child(Some(editor_canvas.widget()));
+        right_paned.set_end_child(Some(tool_panel.widget()));
+
+        main_paned.set_start_child(Some(resource_list.widget()));
+        main_paned.set_end_child(Some(&right_paned));
 
         let tab_box = Box::new(Orientation::Horizontal, 4);
         let label = Label::new(Some(&tab_name));
@@ -291,15 +515,17 @@ impl MainWindow {
         *self.tab_counter.borrow_mut() += 1;
 
         let tab = PakTab {
-            pak_file: pak,
+            pak_file: RefCell::new(pak),
             path,
             resource_list: Rc::clone(&resource_list),
             editor_canvas: Rc::clone(&editor_canvas),
+            tool_panel: Rc::clone(&tool_panel),
+            current_resource_id: RefCell::new(None),
         };
 
         self.tabs.borrow_mut().insert(page_num, tab);
-        self.notebook.append_page(&paned, Some(&tab_box));
-        
+        self.notebook.append_page(&main_paned, Some(&tab_box));
+
         let total_pages = self.notebook.n_pages();
         if total_pages > 0 {
             self.notebook.set_current_page(Some(total_pages - 1));
@@ -312,11 +538,62 @@ impl MainWindow {
             }
         });
 
+        // Setup resource selection callback
         let editor_canvas_weak = Rc::downgrade(&editor_canvas);
+        let this_weak = self.self_weak.borrow().clone();
+        let page_num_for_cb = page_num;
+
         resource_list.on_selected(move |resource: &Resource| {
-            println!("[DEBUG] Selected resource: {} ({} bytes)", resource.id, resource.data.len());
+            println!("[DEBUG] Selected resource: {} ({} bytes, format: {:?})", resource.id, resource.data.len(), resource.format);
             if let Some(canvas) = editor_canvas_weak.upgrade() {
-                canvas.set_base_image(&image::DynamicImage::new_rgba8(100, 100));
+                // Decode the image and load into canvas
+                let data = &resource.data;
+                println!("[DEBUG] Attempting to load image from {} bytes", data.len());
+                
+                match image::load_from_memory(data) {
+                    Ok(img) => {
+                        let (w, h) = (img.width(), img.height());
+                        println!("[DEBUG] Image loaded successfully: {}x{}", w, h);
+                        canvas.set_base_image(&img);
+                        println!("[DEBUG] Image set to canvas");
+
+                        // Setup change callback
+                        let this_weak2 = this_weak.clone();
+                        canvas.set_on_changed_callback(move |has_changes| {
+                            println!("[DEBUG] Changes state: {}", has_changes);
+                            if let Some(this) = this_weak2.upgrade() {
+                                let current_page = this.notebook.current_page();
+                                if let Some(page_num) = current_page {
+                                    let tabs = this.tabs.borrow();
+                                    if let Some(tab) = tabs.get(&page_num) {
+                                        this.update_toolbar_buttons(tab);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[DEBUG] Failed to load image: {}", e);
+                    }
+                }
+
+                // Store current resource ID using the known page_num
+                if let Some(this) = this_weak.upgrade() {
+                    let tabs = this.tabs.borrow();
+                    if let Some(tab) = tabs.get(&page_num_for_cb) {
+                        *tab.current_resource_id.borrow_mut() = Some(resource.id);
+                    }
+                }
+            }
+        });
+
+        // Setup right-click context menu
+        let this_weak = self.self_weak.borrow().clone();
+        let page_num_for_menu = page_num;
+        resource_list.on_context_menu(move |resource: &Resource, x, y| {
+            println!("[DEBUG] Right-click on resource {} at ({}, {})", resource.id, x, y);
+            if let Some(this) = this_weak.upgrade() {
+                this.show_resource_context_menu(resource, x, y, page_num_for_menu);
             }
         });
 
@@ -336,6 +613,13 @@ impl MainWindow {
             if self.tabs.borrow().is_empty() {
                 self.current_file_label.set_text("No file opened");
                 self.status_bar.push(0, "All tabs closed");
+                // Disable buttons
+                if let Some(ref save_btn) = *self.save_btn.borrow() {
+                    save_btn.set_sensitive(false);
+                }
+                if let Some(ref export_btn) = *self.export_btn.borrow() {
+                    export_btn.set_sensitive(false);
+                }
             }
         }
     }
@@ -346,7 +630,123 @@ impl MainWindow {
             let name = get_pak_display_name(&tab.path);
             self.current_file_label.set_text(&name);
             self.status_bar.push(0, &format!("Switched to tab: {}", name));
+            self.update_toolbar_buttons(tab);
         }
+    }
+
+    fn show_resource_context_menu(&self, resource: &Resource, _x: f64, _y: f64, _page_num: u32) {
+        // Create a simple menu using a popover
+        let menu_box = Box::new(Orientation::Vertical, 0);
+        menu_box.add_css_class("menu");
+        
+        // Open externally button
+        let open_btn = Button::builder()
+            .label("Open with External Application")
+            .has_frame(false)
+            .build();
+        
+        // Save to file button
+        let save_btn = Button::builder()
+            .label("Save to File...")
+            .has_frame(false)
+            .build();
+        
+        menu_box.append(&open_btn);
+        menu_box.append(&gtk4::Separator::new(Orientation::Horizontal));
+        menu_box.append(&save_btn);
+        
+        // Create popover menu
+        let popover = gtk4::Popover::builder()
+            .child(&menu_box)
+            .autohide(true)
+            .build();
+        
+        // Position the popover near the resource list
+        popover.set_parent(&self.notebook);
+        
+        // Clone resource data for callbacks
+        let resource_data = resource.data.clone();
+        let resource_id = resource.id;
+        let window_weak = self.window.downgrade();
+        
+        open_btn.connect_clicked(move |_btn| {
+            // Save to temp file and open with external app
+            if let Ok(temp_dir) = std::env::temp_dir().canonicalize() {
+                let temp_file = temp_dir.join(format!("pak_resource_{}.png", resource_id));
+                if let Err(e) = std::fs::write(&temp_file, &resource_data) {
+                    eprintln!("[DEBUG] Failed to write temp file: {}", e);
+                    return;
+                }
+                
+                // Open with xdg-open (Linux) or equivalent
+                let result = std::process::Command::new("xdg-open")
+                    .arg(&temp_file)
+                    .spawn();
+                
+                if let Err(e) = result {
+                    eprintln!("[DEBUG] Failed to open external app: {}", e);
+                    // Try gnome-specific apps
+                    let _ = std::process::Command::new("eog")  // Eye of GNOME
+                        .arg(&temp_file)
+                        .spawn();
+                }
+            }
+            
+            if let Some(window) = window_weak.upgrade() {
+                let popover = window.first_child()
+                    .and_then(|c| c.first_child())
+                    .and_then(|c| c.downcast::<gtk4::Popover>().ok());
+                if let Some(p) = popover {
+                    p.popdown();
+                }
+            }
+        });
+        
+        let resource_data2 = resource.data.clone();
+        let resource_id2 = resource.id;
+        let window_weak2 = self.window.downgrade();
+        
+        save_btn.connect_clicked(move |btn| {
+            // Use native file dialog through zenity or similar
+            let initial_name = format!("resource_{}.png", resource_id2);
+            let data_clone = resource_data2.clone();
+            
+            // Try to use zenity for file chooser
+            let result = std::process::Command::new("zenity")
+                .args(&["--file-selection", "--save", "--filename", &initial_name, "--title", "Save Image"])
+                .output();
+            
+            let path = match result {
+                Ok(output) if output.status.success() => {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                }
+                _ => {
+                    // Fallback to temp file
+                    let temp_dir = std::env::temp_dir();
+                    let temp_file = temp_dir.join(&initial_name);
+                    temp_file.to_string_lossy().to_string()
+                }
+            };
+            
+            if !path.is_empty() {
+                if let Err(e) = std::fs::write(&path, &data_clone) {
+                    eprintln!("[DEBUG] Failed to save file: {}", e);
+                } else {
+                    println!("[DEBUG] Saved to {}", path);
+                }
+            }
+            
+            // Close the popover
+            if let Some(parent) = btn.parent() {
+                if let Some(popover) = parent.parent().and_then(|p| p.downcast::<gtk4::Popover>().ok()) {
+                    popover.popdown();
+                }
+            }
+        });
+        
+        // Show the popover - position at mouse coordinates relative to window
+        popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(_x as i32, _y as i32, 1, 1)));
+        popover.popup();
     }
 
     fn show_error_dialog(&self, title: &str, message: &str) {
