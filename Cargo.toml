@@ -1,0 +1,17 @@
+[package]
+name = "pak-assets-manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gtk4 = { version = "0.8", features = ["v4_12"] }
+glib = "0.19"
+libadwaita = "0.6"
+image = { version = "0.25", features = ["png", "webp"] }
+png = "0.17"
+cairo-rs = "0.19"
+anyhow = "1.0"
+thiserror = "1.0"
+byteorder = "1.5"
+dirs = "5.0"
+lazy_static = "1.4"
