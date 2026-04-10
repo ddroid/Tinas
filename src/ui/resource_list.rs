@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{Label, ListBox, ListBoxRow, ScrolledWindow};
+use gtk4::{Label, ListBox, ListBoxRow, ScrolledWindow, MenuButton, Popover, gio};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -7,6 +7,8 @@ use crate::pak::Resource;
 
 type SelectedCallback = std::boxed::Box<dyn Fn(&Resource)>;
 type ContextMenuCallback = std::boxed::Box<dyn Fn(&Resource, f64, f64)>;
+type OpenExternalCallback = std::boxed::Box<dyn Fn(&Resource)>;
+type VersionHistoryCallback = std::boxed::Box<dyn Fn(&Resource)>;
 
 pub struct ResourceList {
     container: ScrolledWindow,
@@ -14,6 +16,8 @@ pub struct ResourceList {
     resources: Rc<RefCell<Vec<Resource>>>,
     on_selected: Rc<RefCell<Option<SelectedCallback>>>,
     on_context_menu: Rc<RefCell<Option<ContextMenuCallback>>>,
+    on_open_external: Rc<RefCell<Option<OpenExternalCallback>>>,
+    on_version_history: Rc<RefCell<Option<VersionHistoryCallback>>>,
 }
 
 impl ResourceList {
@@ -34,11 +38,27 @@ impl ResourceList {
             resources: Rc::new(RefCell::new(Vec::new())),
             on_selected: Rc::new(RefCell::new(None)),
             on_context_menu: Rc::new(RefCell::new(None)),
+            on_open_external: Rc::new(RefCell::new(None)),
+            on_version_history: Rc::new(RefCell::new(None)),
         };
         
         this.setup_signals();
         this.setup_right_click();
         this
+    }
+    
+    pub fn on_open_external<F>(&self, callback: F)
+    where
+        F: Fn(&Resource) + 'static,
+    {
+        *self.on_open_external.borrow_mut() = Some(Box::new(callback));
+    }
+    
+    pub fn on_version_history<F>(&self, callback: F)
+    where
+        F: Fn(&Resource) + 'static,
+    {
+        *self.on_version_history.borrow_mut() = Some(Box::new(callback));
     }
     
     fn get_row_index(&self, target_row: &ListBoxRow) -> Option<usize> {
@@ -148,29 +168,35 @@ impl ResourceList {
         *self.resources.borrow_mut() = resources;
         println!("[RESOURCE LIST] Resources stored, total: {}", self.resources.borrow().len());
         
-        for resource in self.resources.borrow().iter() {
-            let row = self.create_resource_row(resource);
+        for (index, resource) in self.resources.borrow().iter().enumerate() {
+            let row = self.create_resource_row(resource, index);
             self.list_box.append(&row);
         }
         println!("[RESOURCE LIST] {} rows added to list", self.list_box.observe_children().n_items());
     }
     
-    fn create_resource_row(&self, resource: &Resource) -> ListBoxRow {
+    fn create_resource_row(&self, resource: &Resource, index: usize) -> ListBoxRow {
         let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         hbox.set_margin_start(8);
         hbox.set_margin_end(8);
         hbox.set_margin_top(4);
         hbox.set_margin_bottom(4);
+        hbox.set_hexpand(true);
+        
+        // Left side: Resource info
+        let info_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        info_box.set_hexpand(true);
+        info_box.set_halign(gtk4::Align::Start);
         
         // Resource ID label
         let id_label = Label::new(Some(&format!("ID: {}", resource.id)));
-        hbox.append(&id_label);
+        info_box.append(&id_label);
         
         // Size info if available
         if let (Some(w), Some(h)) = (resource.width, resource.height) {
             let size_label = Label::new(Some(&format!("({}x{})", w, h)));
             size_label.add_css_class("dim-label");
-            hbox.append(&size_label);
+            info_box.append(&size_label);
         }
         
         // Format label
@@ -181,7 +207,71 @@ impl ResourceList {
         };
         let format_label = Label::new(Some(format_str));
         format_label.add_css_class("dim-label");
-        hbox.append(&format_label);
+        info_box.append(&format_label);
+        
+        hbox.append(&info_box);
+        
+        // Right side: Three-dot menu button
+        let menu_button = MenuButton::new();
+        menu_button.set_icon_name("view-more-symbolic");
+        menu_button.set_valign(gtk4::Align::Center);
+        menu_button.add_css_class("flat");
+        menu_button.add_css_class("circular");
+        
+        // Create menu model
+        let menu = gio::Menu::new();
+        menu.append(Some("Open Externally"), Some(&format!("resource.open_external.{}", index)));
+        menu.append(Some("Version History"), Some(&format!("resource.version_history.{}", index)));
+        
+        menu_button.set_menu_model(Some(&menu));
+        
+        // Use a popover with custom buttons
+        let popover = Popover::new();
+        let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        popover_box.set_margin_top(8);
+        popover_box.set_margin_bottom(8);
+        popover_box.set_margin_start(8);
+        popover_box.set_margin_end(8);
+        
+        // Open Externally button
+        let open_btn = gtk4::Button::with_label("Open Externally");
+        open_btn.add_css_class("flat");
+        let on_open_external = self.on_open_external.clone();
+        let resources = self.resources.clone();
+        let resource_id = resource.id;
+        open_btn.connect_clicked(move |_| {
+            if let Some(ref callback) = *on_open_external.borrow() {
+                if let Some(res) = resources.borrow().iter().find(|r| r.id == resource_id) {
+                    callback(res);
+                }
+            }
+        });
+        popover_box.append(&open_btn);
+        
+        // Version History button
+        let history_btn = gtk4::Button::with_label("Version History");
+        history_btn.add_css_class("flat");
+        let on_version_history = self.on_version_history.clone();
+        let resources = self.resources.clone();
+        let resource_id = resource.id;
+        history_btn.connect_clicked(move |_| {
+            if let Some(ref callback) = *on_version_history.borrow() {
+                if let Some(res) = resources.borrow().iter().find(|r| r.id == resource_id) {
+                    callback(res);
+                }
+            }
+        });
+        popover_box.append(&history_btn);
+        
+        popover.set_child(Some(&popover_box));
+        popover.set_autohide(true);
+        popover.set_has_arrow(true);
+        popover.set_position(gtk4::PositionType::Right);
+        
+        menu_button.set_popover(Some(&popover));
+        menu_button.set_create_popup_func(|_| {}); // Disable default popup
+        
+        hbox.append(&menu_button);
         
         let row = ListBoxRow::new();
         row.set_child(Some(&hbox));

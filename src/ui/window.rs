@@ -12,8 +12,10 @@ use crate::pak::Resource;
 use crate::ui::resource_list::ResourceList;
 use crate::ui::editor_canvas::EditorCanvas;
 use crate::ui::tool_panel::ToolPanel;
+use crate::ui::version_history_dialog::VersionHistoryDialog;
 use crate::browser_detector::{detect_browsers, get_pak_display_name};
 use crate::image_processor::optimizer::encode_png;
+use crate::temp_db::TempDb;
 
 /// Data for a single pak file tab
 struct PakTab {
@@ -33,6 +35,7 @@ pub struct MainWindow {
     current_file_label: Label,
     tab_counter: RefCell<u32>,
     self_weak: RefCell<std::rc::Weak<Self>>,
+    temp_db: Rc<RefCell<TempDb>>,
     // Bottom toolbar buttons
     save_btn: RefCell<Option<Button>>,
     export_btn: RefCell<Option<Button>>,
@@ -139,6 +142,7 @@ impl MainWindow {
             current_file_label,
             tab_counter: RefCell::new(0),
             self_weak: RefCell::new(std::rc::Weak::new()),
+            temp_db: Rc::new(RefCell::new(TempDb::new())),
             save_btn: RefCell::new(Some(save_btn)),
             export_btn: RefCell::new(Some(export_btn)),
             undo_btn: RefCell::new(Some(undo_btn)),
@@ -263,33 +267,92 @@ impl MainWindow {
         }
     }
 
-    fn save_current_resource(&self, tab: &PakTab) {
+    fn pak_key_for_tab(tab: &PakTab) -> String {
+        tab.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    }
+
+    fn store_current_draft(&self, tab: &PakTab, action: &str) {
         if let Some(resource_id) = *tab.current_resource_id.borrow() {
             if let Some(image) = tab.editor_canvas.get_composite_image() {
-                match encode_png(&image, 6) {
-                    Ok(png_data) => {
-                        // Update the pak file
-                        let mut pak = tab.pak_file.borrow_mut();
-                        if let Err(e) = pak.replace_resource(resource_id, png_data) {
-                            self.show_error_dialog("Save Error", &format!("Failed to update resource: {}", e));
-                            return;
-                        }
-                        // Clear changes flag
-                        tab.editor_canvas.clear_changes();
-                        self.update_toolbar_buttons(tab);
-                        self.status_bar.push(0, &format!("Saved changes to resource {}", resource_id));
-                    }
-                    Err(e) => {
-                        self.show_error_dialog("Export Error", &format!("Failed to encode PNG: {}", e));
-                    }
+                if let Ok(png_data) = encode_png(&image, 6) {
+                    let pak_key = Self::pak_key_for_tab(tab);
+                    self.temp_db
+                        .borrow_mut()
+                        .add_version(&pak_key, resource_id, action, png_data);
                 }
             }
         }
     }
 
+    fn maybe_store_active_resource_draft(&self, tab: &PakTab, resource_id: u16, action: &str) {
+        if *tab.current_resource_id.borrow() == Some(resource_id) && tab.editor_canvas.has_changes() {
+            self.store_current_draft(tab, action);
+        }
+    }
+
+    fn get_resource_image_data(&self, tab: &PakTab, resource_id: u16) -> Option<Vec<u8>> {
+        let pak_key = Self::pak_key_for_tab(tab);
+
+        if let Some(version_id) = self.temp_db.borrow().get_current_version_id(&pak_key, resource_id) {
+            if let Some(version) = self.temp_db.borrow().get_version(&pak_key, resource_id, &version_id) {
+                return Some(version.image_data.clone());
+            }
+        }
+
+        tab.pak_file
+            .borrow()
+            .resources
+            .iter()
+            .find(|r| r.id == resource_id)
+            .map(|r| r.data.clone())
+    }
+
+    fn save_current_resource(&self, tab: &PakTab) -> bool {
+        if let Some(resource_id) = *tab.current_resource_id.borrow() {
+            if let Some(image) = tab.editor_canvas.get_composite_image() {
+                match encode_png(&image, 6) {
+                    Ok(png_data) => {
+                        let pak_key = Self::pak_key_for_tab(tab);
+                        // Update the pak file
+                        let mut pak = tab.pak_file.borrow_mut();
+                        if let Err(e) = pak.replace_resource(resource_id, png_data.clone()) {
+                            self.show_error_dialog("Save Error", &format!("Failed to update resource: {}", e));
+                            return false;
+                        }
+
+                        self.temp_db.borrow_mut().add_version(
+                            &pak_key,
+                            resource_id,
+                            "Saved resource",
+                            png_data,
+                        );
+                        self.temp_db.borrow_mut().mark_saved(&pak_key, resource_id);
+
+                        // Clear changes flag
+                        tab.editor_canvas.clear_changes();
+                        self.update_toolbar_buttons(tab);
+                        self.status_bar.push(0, &format!("Saved changes to resource {}", resource_id));
+                        return true;
+                    }
+                    Err(e) => {
+                        self.show_error_dialog("Export Error", &format!("Failed to encode PNG: {}", e));
+                        return false;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     fn export_to_brave(&self, tab: &PakTab) {
-        // First save the current resource
-        self.save_current_resource(tab);
+        if tab.editor_canvas.has_changes() && !self.save_current_resource(tab) {
+            return;
+        }
 
         // Then write the pak file back to the original path
         let pak = tab.pak_file.borrow();
@@ -546,41 +609,44 @@ impl MainWindow {
         resource_list.on_selected(move |resource: &Resource| {
             println!("[DEBUG] Selected resource: {} ({} bytes, format: {:?})", resource.id, resource.data.len(), resource.format);
             if let Some(canvas) = editor_canvas_weak.upgrade() {
-                // Decode the image and load into canvas
-                let data = &resource.data;
-                println!("[DEBUG] Attempting to load image from {} bytes", data.len());
-                
-                match image::load_from_memory(data) {
-                    Ok(img) => {
-                        let (w, h) = (img.width(), img.height());
-                        println!("[DEBUG] Image loaded successfully: {}x{}", w, h);
-                        canvas.set_base_image(&img);
-                        println!("[DEBUG] Image set to canvas");
-
-                        // Setup change callback
-                        let this_weak2 = this_weak.clone();
-                        canvas.set_on_changed_callback(move |has_changes| {
-                            println!("[DEBUG] Changes state: {}", has_changes);
-                            if let Some(this) = this_weak2.upgrade() {
-                                let current_page = this.notebook.current_page();
-                                if let Some(page_num) = current_page {
-                                    let tabs = this.tabs.borrow();
-                                    if let Some(tab) = tabs.get(&page_num) {
-                                        this.update_toolbar_buttons(tab);
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("[DEBUG] Failed to load image: {}", e);
-                    }
-                }
-
-                // Store current resource ID using the known page_num
                 if let Some(this) = this_weak.upgrade() {
                     let tabs = this.tabs.borrow();
                     if let Some(tab) = tabs.get(&page_num_for_cb) {
+                        let previous_resource_id = *tab.current_resource_id.borrow();
+                        if previous_resource_id != Some(resource.id) && tab.editor_canvas.has_changes() {
+                            this.store_current_draft(tab, "Switched resource");
+                        }
+
+                        if let Some(data) = this.get_resource_image_data(tab, resource.id) {
+                            println!("[DEBUG] Attempting to load image from {} bytes", data.len());
+
+                            match image::load_from_memory(&data) {
+                                Ok(img) => {
+                                    let (w, h) = (img.width(), img.height());
+                                    println!("[DEBUG] Image loaded successfully: {}x{}", w, h);
+                                    canvas.set_base_image(&img);
+                                    println!("[DEBUG] Image set to canvas");
+
+                                    let this_weak2 = this_weak.clone();
+                                    canvas.set_on_changed_callback(move |has_changes| {
+                                        println!("[DEBUG] Changes state: {}", has_changes);
+                                        if let Some(this) = this_weak2.upgrade() {
+                                            let current_page = this.notebook.current_page();
+                                            if let Some(page_num) = current_page {
+                                                let tabs = this.tabs.borrow();
+                                                if let Some(tab) = tabs.get(&page_num) {
+                                                    this.update_toolbar_buttons(tab);
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!("[DEBUG] Failed to load image: {}", e);
+                                }
+                            }
+                        }
+
                         *tab.current_resource_id.borrow_mut() = Some(resource.id);
                     }
                 }
@@ -594,6 +660,26 @@ impl MainWindow {
             println!("[DEBUG] Right-click on resource {} at ({}, {})", resource.id, x, y);
             if let Some(this) = this_weak.upgrade() {
                 this.show_resource_context_menu(resource, x, y, page_num_for_menu);
+            }
+        });
+        
+        // Setup three-dot menu: Open Externally
+        let this_weak = self.self_weak.borrow().clone();
+        let page_num_for_external = page_num;
+        resource_list.on_open_external(move |resource: &Resource| {
+            println!("[DEBUG] Open externally: resource {}", resource.id);
+            if let Some(this) = this_weak.upgrade() {
+                this.open_resource_externally(resource, page_num_for_external);
+            }
+        });
+        
+        // Setup three-dot menu: Version History
+        let this_weak = self.self_weak.borrow().clone();
+        let page_num_for_history = page_num;
+        resource_list.on_version_history(move |resource: &Resource| {
+            println!("[DEBUG] Version history: resource {}", resource.id);
+            if let Some(this) = this_weak.upgrade() {
+                this.show_version_history(resource, page_num_for_history);
             }
         });
 
@@ -634,7 +720,7 @@ impl MainWindow {
         }
     }
 
-    fn show_resource_context_menu(&self, resource: &Resource, _x: f64, _y: f64, _page_num: u32) {
+    fn show_resource_context_menu(&self, resource: &Resource, _x: f64, _y: f64, page_num: u32) {
         // Create a simple menu using a popover
         let menu_box = Box::new(Orientation::Vertical, 0);
         menu_box.add_css_class("menu");
@@ -663,17 +749,27 @@ impl MainWindow {
         
         // Position the popover near the resource list
         popover.set_parent(&self.notebook);
-        
-        // Clone resource data for callbacks
-        let resource_data = resource.data.clone();
+
         let resource_id = resource.id;
+        let resource_data = {
+            let tabs = self.tabs.borrow();
+            if let Some(tab) = tabs.get(&page_num) {
+                self.maybe_store_active_resource_draft(tab, resource_id, "Opened resource menu");
+                self.get_resource_image_data(tab, resource_id)
+                    .unwrap_or_else(|| resource.data.clone())
+            } else {
+                resource.data.clone()
+            }
+        };
+        let resource_data_open = resource_data.clone();
+        let resource_data_save = resource_data.clone();
         let window_weak = self.window.downgrade();
         
         open_btn.connect_clicked(move |_btn| {
             // Save to temp file and open with external app
             if let Ok(temp_dir) = std::env::temp_dir().canonicalize() {
                 let temp_file = temp_dir.join(format!("pak_resource_{}.png", resource_id));
-                if let Err(e) = std::fs::write(&temp_file, &resource_data) {
+                if let Err(e) = std::fs::write(&temp_file, &resource_data_open) {
                     eprintln!("[DEBUG] Failed to write temp file: {}", e);
                     return;
                 }
@@ -702,9 +798,8 @@ impl MainWindow {
             }
         });
         
-        let resource_data2 = resource.data.clone();
+        let resource_data2 = resource_data_save.clone();
         let resource_id2 = resource.id;
-        let window_weak2 = self.window.downgrade();
         
         save_btn.connect_clicked(move |btn| {
             // Use native file dialog through zenity or similar
@@ -747,6 +842,86 @@ impl MainWindow {
         // Show the popover - position at mouse coordinates relative to window
         popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(_x as i32, _y as i32, 1, 1)));
         popover.popup();
+    }
+    
+    fn open_resource_externally(&self, resource: &Resource, page_num: u32) {
+        // Save to temp file and open with external app
+        if let Ok(temp_dir) = std::env::temp_dir().canonicalize() {
+            let data = {
+                let tabs = self.tabs.borrow();
+                if let Some(tab) = tabs.get(&page_num) {
+                    self.maybe_store_active_resource_draft(tab, resource.id, "Opened externally");
+                    self.get_resource_image_data(tab, resource.id)
+                        .unwrap_or_else(|| resource.data.clone())
+                } else {
+                    resource.data.clone()
+                }
+            };
+
+            let ext = match resource.format {
+                Some(crate::pak::ImageFormat::Png) => "png",
+                Some(crate::pak::ImageFormat::Webp) => "webp",
+                _ => "bin",
+            };
+            let temp_file = temp_dir.join(format!("pak_resource_{}.{}", resource.id, ext));
+            if let Err(e) = std::fs::write(&temp_file, &data) {
+                eprintln!("[DEBUG] Failed to write temp file: {}", e);
+                self.show_error_dialog("Error", &format!("Failed to write temp file: {}", e));
+                return;
+            }
+            
+            // Open with xdg-open (Linux) or equivalent
+            let result = std::process::Command::new("xdg-open")
+                .arg(&temp_file)
+                .spawn();
+            
+            if let Err(e) = result {
+                eprintln!("[DEBUG] Failed to open external app: {}", e);
+                // Try gnome-specific apps
+                let _ = std::process::Command::new("eog")  // Eye of GNOME
+                    .arg(&temp_file)
+                    .spawn();
+            }
+        }
+    }
+    
+    fn show_version_history(&self, resource: &Resource, page_num: u32) {
+        let tabs = self.tabs.borrow();
+        if let Some(tab) = tabs.get(&page_num) {
+            self.maybe_store_active_resource_draft(tab, resource.id, "Opened version history");
+            let pak_name = tab.path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            
+            // Create version history dialog
+            let dialog = VersionHistoryDialog::new(
+                &self.window,
+                resource.id,
+                pak_name,
+                self.temp_db.clone(),
+            );
+            
+            // Set up restore callback
+            let canvas = tab.editor_canvas.clone();
+            let temp_db = self.temp_db.clone();
+            let pak_name = pak_name.to_string();
+            let resource_id = resource.id;
+            dialog.set_on_restore(move |image_data: &[u8]| {
+                // Load the restored image into the canvas
+                if let Ok(img) = image::load_from_memory(image_data) {
+                    canvas.set_base_image(&img);
+                    temp_db.borrow_mut().add_version(
+                        &pak_name,
+                        resource_id,
+                        "Restored version",
+                        image_data.to_vec(),
+                    );
+                    canvas.mark_changed();
+                }
+            });
+            
+            dialog.show();
+        }
     }
 
     fn show_error_dialog(&self, title: &str, message: &str) {

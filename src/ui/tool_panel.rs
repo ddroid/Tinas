@@ -3,16 +3,17 @@ use gtk4::{Box, Button, ColorButton, Label, Orientation, Scale, ScrolledWindow, 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::editor::brush::{Brush, Eraser};
+use crate::editor::brush::{Brush, BrushShape, Eraser};
 use crate::ui::editor_canvas::{EditorCanvas, Tool};
 
 pub struct ToolPanel {
     container: ScrolledWindow,
     content: Box,
-    editor_canvas: RefCell<Option<Rc<EditorCanvas>>>,
-    current_color: RefCell<(f64, f64, f64, f64)>,
-    current_size: RefCell<f64>,
-    is_brush_active: RefCell<bool>,
+    editor_canvas: Rc<RefCell<Option<Rc<EditorCanvas>>>>,
+    current_color: Rc<RefCell<(f64, f64, f64, f64)>>,
+    current_size: Rc<RefCell<f64>>,
+    current_shape: Rc<RefCell<BrushShape>>,
+    is_brush_active: Rc<RefCell<bool>>,
 }
 
 impl ToolPanel {
@@ -33,10 +34,11 @@ impl ToolPanel {
         let this = Self {
             container,
             content,
-            editor_canvas: RefCell::new(None),
-            current_color: RefCell::new((0.0, 0.0, 0.0, 1.0)),
-            current_size: RefCell::new(8.0),
-            is_brush_active: RefCell::new(true),
+            editor_canvas: Rc::new(RefCell::new(None)),
+            current_color: Rc::new(RefCell::new((1.0, 0.0, 0.0, 1.0))),
+            current_size: Rc::new(RefCell::new(8.0)),
+            current_shape: Rc::new(RefCell::new(BrushShape::Circle)),
+            is_brush_active: Rc::new(RefCell::new(true)),
         };
         
         this.build_ui();
@@ -63,6 +65,7 @@ impl ToolPanel {
         let is_brush = self.is_brush_active.clone();
         let color_ref = self.current_color.clone();
         let size_ref = self.current_size.clone();
+        let shape_ref_tool = self.current_shape.clone();
         let brush_btn_weak = brush_btn.downgrade();
         let eraser_btn_weak = eraser_btn.downgrade();
         
@@ -71,7 +74,8 @@ impl ToolPanel {
             if let Some(ref canvas) = *canvas_ref.borrow() {
                 let (r, g, b, a) = *color_ref.borrow();
                 let size = *size_ref.borrow();
-                canvas.set_tool(Tool::Brush(Brush::new(size, (r, g, b, a))));
+                let shape = *shape_ref_tool.borrow();
+                canvas.set_tool(Tool::Brush(Brush::new(size, (r, g, b, a)).with_shape(shape)));
             }
             if let Some(ref btn) = brush_btn_weak.upgrade() {
                 btn.add_css_class("suggested-action");
@@ -84,6 +88,7 @@ impl ToolPanel {
         let canvas_ref2 = self.editor_canvas.clone();
         let is_brush2 = self.is_brush_active.clone();
         let size_ref2 = self.current_size.clone();
+        let shape_ref_tool2 = self.current_shape.clone();
         let brush_btn_weak2 = brush_btn.downgrade();
         let eraser_btn_weak2 = eraser_btn.downgrade();
         
@@ -91,7 +96,9 @@ impl ToolPanel {
             *is_brush2.borrow_mut() = false;
             if let Some(ref canvas) = *canvas_ref2.borrow() {
                 let size = *size_ref2.borrow();
-                canvas.set_tool(Tool::Eraser(Eraser::new(size)));
+                let mut eraser = Eraser::new(size);
+                eraser.shape = *shape_ref_tool2.borrow();
+                canvas.set_tool(Tool::Eraser(eraser));
             }
             if let Some(ref btn) = brush_btn_weak2.upgrade() {
                 btn.remove_css_class("suggested-action");
@@ -132,6 +139,96 @@ impl ToolPanel {
         
         self.content.append(&Separator::new(Orientation::Horizontal));
         
+        // Brush Shape Section
+        let shape_label = Label::new(Some("Brush Shape"));
+        shape_label.add_css_class("heading");
+        shape_label.set_halign(gtk4::Align::Start);
+        self.content.append(&shape_label);
+        
+        let shape_box = Box::new(Orientation::Horizontal, 8);
+        shape_box.set_halign(gtk4::Align::Center);
+        
+        let circle_btn = Button::with_label("Circle");
+        let square_btn = Button::with_label("Square");
+        let line_btn = Button::with_label("Line");
+        
+        // Set initial active state
+        circle_btn.add_css_class("suggested-action");
+        
+        // Clone references for shape callbacks
+        let canvas_ref_shape = self.editor_canvas.clone();
+        let shape_ref = self.current_shape.clone();
+        let circle_btn_weak = circle_btn.downgrade();
+        let square_btn_weak = square_btn.downgrade();
+        let line_btn_weak = line_btn.downgrade();
+        
+        circle_btn.connect_clicked(move |_btn| {
+            *shape_ref.borrow_mut() = BrushShape::Circle;
+            if let Some(ref canvas) = *canvas_ref_shape.borrow() {
+                canvas.set_brush_shape(BrushShape::Circle);
+            }
+            if let Some(ref btn) = circle_btn_weak.upgrade() {
+                btn.add_css_class("suggested-action");
+            }
+            if let Some(ref btn) = square_btn_weak.upgrade() {
+                btn.remove_css_class("suggested-action");
+            }
+            if let Some(ref btn) = line_btn_weak.upgrade() {
+                btn.remove_css_class("suggested-action");
+            }
+        });
+        
+        let canvas_ref_shape2 = self.editor_canvas.clone();
+        let shape_ref2 = self.current_shape.clone();
+        let circle_btn_weak2 = circle_btn.downgrade();
+        let square_btn_weak2 = square_btn.downgrade();
+        let line_btn_weak2 = line_btn.downgrade();
+        
+        square_btn.connect_clicked(move |_btn| {
+            *shape_ref2.borrow_mut() = BrushShape::Square;
+            if let Some(ref canvas) = *canvas_ref_shape2.borrow() {
+                canvas.set_brush_shape(BrushShape::Square);
+            }
+            if let Some(ref btn) = circle_btn_weak2.upgrade() {
+                btn.remove_css_class("suggested-action");
+            }
+            if let Some(ref btn) = square_btn_weak2.upgrade() {
+                btn.add_css_class("suggested-action");
+            }
+            if let Some(ref btn) = line_btn_weak2.upgrade() {
+                btn.remove_css_class("suggested-action");
+            }
+        });
+        
+        let canvas_ref_shape3 = self.editor_canvas.clone();
+        let shape_ref3 = self.current_shape.clone();
+        let circle_btn_weak3 = circle_btn.downgrade();
+        let square_btn_weak3 = square_btn.downgrade();
+        let line_btn_weak3 = line_btn.downgrade();
+        
+        line_btn.connect_clicked(move |_btn| {
+            *shape_ref3.borrow_mut() = BrushShape::Line;
+            if let Some(ref canvas) = *canvas_ref_shape3.borrow() {
+                canvas.set_brush_shape(BrushShape::Line);
+            }
+            if let Some(ref btn) = circle_btn_weak3.upgrade() {
+                btn.remove_css_class("suggested-action");
+            }
+            if let Some(ref btn) = square_btn_weak3.upgrade() {
+                btn.remove_css_class("suggested-action");
+            }
+            if let Some(ref btn) = line_btn_weak3.upgrade() {
+                btn.add_css_class("suggested-action");
+            }
+        });
+        
+        shape_box.append(&circle_btn);
+        shape_box.append(&square_btn);
+        shape_box.append(&line_btn);
+        self.content.append(&shape_box);
+        
+        self.content.append(&Separator::new(Orientation::Horizontal));
+        
         // Color Section
         let color_label = Label::new(Some("Color"));
         color_label.add_css_class("heading");
@@ -139,13 +236,13 @@ impl ToolPanel {
         self.content.append(&color_label);
         
         let color_btn = ColorButton::new();
-        color_btn.set_rgba(&gtk4::gdk::RGBA::new(0.0, 0.0, 0.0, 1.0));
+        color_btn.set_rgba(&gtk4::gdk::RGBA::new(1.0, 0.0, 0.0, 1.0));
         color_btn.set_use_alpha(true);
         
         let canvas_ref = self.editor_canvas.clone();
         let color_ref = self.current_color.clone();
         let is_brush = self.is_brush_active.clone();
-        let size_ref = self.current_size.clone();
+        let shape_ref_color = self.current_shape.clone();
         
         color_btn.connect_color_set(move |btn| {
             let rgba = btn.rgba();
@@ -154,9 +251,8 @@ impl ToolPanel {
             
             if *is_brush.borrow() {
                 if let Some(ref canvas) = *canvas_ref.borrow() {
-                    let size = *size_ref.borrow();
                     canvas.set_brush_color(r, g, b, a);
-                    canvas.set_tool(Tool::Brush(Brush::new(size, (r, g, b, a))));
+                    canvas.set_brush_shape(*shape_ref_color.borrow());
                 }
             }
         });
@@ -205,7 +301,7 @@ impl ToolPanel {
             let canvas_ref = self.editor_canvas.clone();
             let color_ref = self.current_color.clone();
             let is_brush = self.is_brush_active.clone();
-            let size_ref = self.current_size.clone();
+            let shape_ref_preset = self.current_shape.clone();
             let color_btn_weak = color_btn.downgrade();
             
             btn.connect_clicked(move |_btn| {
@@ -215,9 +311,8 @@ impl ToolPanel {
                 }
                 if *is_brush.borrow() {
                     if let Some(ref canvas) = *canvas_ref.borrow() {
-                        let size = *size_ref.borrow();
                         canvas.set_brush_color(r, g, b, a);
-                        canvas.set_tool(Tool::Brush(Brush::new(size, (r, g, b, a))));
+                        canvas.set_brush_shape(*shape_ref_preset.borrow());
                     }
                 }
             });
@@ -249,7 +344,19 @@ impl ToolPanel {
     }
     
     pub fn set_editor_canvas(&self, canvas: Rc<EditorCanvas>) {
-        *self.editor_canvas.borrow_mut() = Some(canvas);
+        *self.editor_canvas.borrow_mut() = Some(Rc::clone(&canvas));
+
+        let (r, g, b, a) = *self.current_color.borrow();
+        let size = *self.current_size.borrow();
+        let shape = *self.current_shape.borrow();
+
+        if *self.is_brush_active.borrow() {
+            canvas.set_tool(Tool::Brush(Brush::new(size, (r, g, b, a)).with_shape(shape)));
+        } else {
+            let mut eraser = Eraser::new(size);
+            eraser.shape = shape;
+            canvas.set_tool(Tool::Eraser(eraser));
+        }
     }
     
     pub fn widget(&self) -> &ScrolledWindow {

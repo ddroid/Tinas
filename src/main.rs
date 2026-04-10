@@ -3,6 +3,7 @@ mod image_processor;
 mod editor;
 mod ui;
 mod browser_detector;
+mod temp_db;
 
 use gtk4::prelude::*;
 use gtk4::Application;
