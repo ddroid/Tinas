@@ -1,7 +1,7 @@
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, HeaderBar, Box, Button,
            Orientation, Paned, Label, Statusbar, Notebook, ScrolledWindow, CheckButton,
-           Separator, ToggleButton, Viewport};
+           Separator, Scale};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,6 +26,8 @@ struct PakTab {
     tool_panel: Rc<ToolPanel>,
     current_resource_id: RefCell<Option<u16>>,
     has_saved_changes: RefCell<bool>, // true once any resource has been saved to in-memory pak
+    main_paned: Paned,
+    right_paned: Paned,
 }
 
 pub struct MainWindow {
@@ -42,6 +44,8 @@ pub struct MainWindow {
     export_btn: RefCell<Option<Button>>,
     undo_btn: RefCell<Option<Button>>,
     redo_btn: RefCell<Option<Button>>,
+    zoom_scale: RefCell<Option<Scale>>,
+    zoom_label: RefCell<Option<Label>>,
 }
 
 impl MainWindow {
@@ -89,10 +93,35 @@ impl MainWindow {
         // Main content
         let main_box = Box::new(Orientation::Vertical, 0);
 
-        // Notebook for tabs
+        // Notebook for tabs with sidebar collapse buttons
         let notebook = Notebook::new();
         notebook.set_vexpand(true);
-        main_box.append(&notebook);
+        notebook.set_scrollable(true);
+
+        // Container: [collapse-left] [notebook] [collapse-right]
+        let tabs_row = Box::new(Orientation::Horizontal, 0);
+        tabs_row.set_vexpand(true);
+
+        let collapse_left_btn = Button::from_icon_name("sidebar-show-symbolic");
+        collapse_left_btn.set_tooltip_text(Some("Toggle Left Sidebar"));
+        collapse_left_btn.set_valign(gtk4::Align::Start);
+        collapse_left_btn.set_has_frame(false);
+        tabs_row.append(&collapse_left_btn);
+
+        tabs_row.append(&notebook);
+        notebook.set_hexpand(true);
+
+        let collapse_right_btn = Button::from_icon_name("sidebar-show-right-symbolic");
+        collapse_right_btn.set_tooltip_text(Some("Toggle Right Sidebar"));
+        collapse_right_btn.set_valign(gtk4::Align::Start);
+        collapse_right_btn.set_has_frame(false);
+        tabs_row.append(&collapse_right_btn);
+
+        main_box.append(&tabs_row);
+
+        // Keep refs for connecting signals later
+        let collapse_left_btn_ref = collapse_left_btn;
+        let collapse_right_btn_ref = collapse_right_btn;
 
         // Bottom toolbar
         let bottom_toolbar = Box::new(Orientation::Horizontal, 8);
@@ -126,6 +155,33 @@ impl MainWindow {
         status_label.set_halign(gtk4::Align::Start);
         bottom_toolbar.append(&status_label);
 
+        bottom_toolbar.append(&Separator::new(Orientation::Vertical));
+
+        // Zoom controls
+        let zoom_label = Label::new(Some("100%"));
+        zoom_label.set_width_chars(5);
+        let zoom_out_btn = Button::with_label("-");
+        zoom_out_btn.set_tooltip_text(Some("Zoom Out (Ctrl+-)"));
+        let zoom_scale = Scale::with_range(Orientation::Horizontal, 10.0, 1000.0, 10.0);
+        zoom_scale.set_value(100.0);
+        zoom_scale.set_draw_value(false);
+        zoom_scale.set_width_request(120);
+        let zoom_in_btn = Button::with_label("+");
+        zoom_in_btn.set_tooltip_text(Some("Zoom In (Ctrl++)"));
+        let zoom_reset_btn = Button::with_label("1:1");
+        zoom_reset_btn.set_tooltip_text(Some("Reset Zoom (Ctrl+0)"));
+
+        bottom_toolbar.append(&zoom_out_btn);
+        bottom_toolbar.append(&zoom_scale);
+        bottom_toolbar.append(&zoom_in_btn);
+        bottom_toolbar.append(&zoom_label);
+        bottom_toolbar.append(&zoom_reset_btn);
+
+        // Zoom button connections will be set up after `this` is created via setup_zoom_buttons
+        let zoom_out_btn_ref = zoom_out_btn;
+        let zoom_in_btn_ref = zoom_in_btn;
+        let zoom_reset_btn_ref = zoom_reset_btn;
+
         main_box.append(&bottom_toolbar);
 
         // Status bar
@@ -148,6 +204,8 @@ impl MainWindow {
             export_btn: RefCell::new(Some(export_btn)),
             undo_btn: RefCell::new(Some(undo_btn)),
             redo_btn: RefCell::new(Some(redo_btn)),
+            zoom_scale: RefCell::new(Some(zoom_scale)),
+            zoom_label: RefCell::new(Some(zoom_label)),
         });
 
         // Set up self-referential weak pointer
@@ -155,6 +213,90 @@ impl MainWindow {
 
         // Setup signals
         Self::setup_signals(&this, &scan_brave_btn);
+
+        // Sidebar collapse button connections
+        {
+            let this_weak = Rc::downgrade(&this);
+            collapse_left_btn_ref.connect_clicked(move |_btn| {
+                if let Some(this) = this_weak.upgrade() {
+                    if let Some(page_num) = this.notebook.current_page() {
+                        let tabs = this.tabs.borrow();
+                        if let Some(tab) = tabs.get(&page_num) {
+                            let pos = tab.main_paned.position();
+                            if pos > 10 {
+                                tab.main_paned.set_position(0);
+                            } else {
+                                tab.main_paned.set_position(250);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        {
+            let this_weak = Rc::downgrade(&this);
+            collapse_right_btn_ref.connect_clicked(move |_btn| {
+                if let Some(this) = this_weak.upgrade() {
+                    if let Some(page_num) = this.notebook.current_page() {
+                        let tabs = this.tabs.borrow();
+                        if let Some(tab) = tabs.get(&page_num) {
+                            let total_w = tab.right_paned.width();
+                            let pos = tab.right_paned.position();
+                            if total_w - pos < 50 {
+                                // Currently collapsed, restore
+                                tab.right_paned.set_position(total_w - 200);
+                            } else {
+                                // Collapse: push position to full width
+                                tab.right_paned.set_position(total_w);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Zoom button connections (need `this` to exist)
+        {
+            let this_weak = Rc::downgrade(&this);
+            zoom_out_btn_ref.connect_clicked(move |_btn| {
+                if let Some(this) = this_weak.upgrade() {
+                    if let Some(canvas) = this.get_active_canvas() {
+                        let zoom = (canvas.get_zoom() / 1.2).max(0.1);
+                        canvas.set_zoom(zoom);
+                        if let Some(ref scale) = *this.zoom_scale.borrow() {
+                            scale.set_value(zoom * 100.0);
+                        }
+                    }
+                }
+            });
+        }
+        {
+            let this_weak = Rc::downgrade(&this);
+            zoom_in_btn_ref.connect_clicked(move |_btn| {
+                if let Some(this) = this_weak.upgrade() {
+                    if let Some(canvas) = this.get_active_canvas() {
+                        let zoom = (canvas.get_zoom() * 1.2).min(10.0);
+                        canvas.set_zoom(zoom);
+                        if let Some(ref scale) = *this.zoom_scale.borrow() {
+                            scale.set_value(zoom * 100.0);
+                        }
+                    }
+                }
+            });
+        }
+        {
+            let this_weak = Rc::downgrade(&this);
+            zoom_reset_btn_ref.connect_clicked(move |_btn| {
+                if let Some(this) = this_weak.upgrade() {
+                    if let Some(canvas) = this.get_active_canvas() {
+                        canvas.set_zoom(1.0);
+                        if let Some(ref scale) = *this.zoom_scale.borrow() {
+                            scale.set_value(100.0);
+                        }
+                    }
+                }
+            });
+        }
 
         this
     }
@@ -224,6 +366,35 @@ impl MainWindow {
                 }
             });
         }
+
+        // Zoom slider
+        if let Some(ref zoom_scale) = *this.zoom_scale.borrow() {
+            let this_weak = this.self_weak.borrow().clone();
+            zoom_scale.connect_value_changed(move |scale| {
+                if let Some(this) = this_weak.upgrade() {
+                    let zoom = scale.value() / 100.0;
+                    if let Some(page_num) = this.notebook.current_page() {
+                        let tabs = this.tabs.borrow();
+                        if let Some(tab) = tabs.get(&page_num) {
+                            tab.editor_canvas.set_zoom(zoom);
+                        }
+                    }
+                    if let Some(ref label) = *this.zoom_label.borrow() {
+                        label.set_text(&format!("{}%", scale.value() as i32));
+                    }
+                }
+            });
+        }
+    }
+
+    fn get_active_canvas(&self) -> Option<Rc<EditorCanvas>> {
+        if let Some(page_num) = self.notebook.current_page() {
+            let tabs = self.tabs.borrow();
+            if let Some(tab) = tabs.get(&page_num) {
+                return Some(Rc::clone(&tab.editor_canvas));
+            }
+        }
+        None
     }
 
     fn on_undo_clicked(&self) {
@@ -622,6 +793,19 @@ impl MainWindow {
         let tool_panel = Rc::new(ToolPanel::new());
         tool_panel.set_editor_canvas(Rc::clone(&editor_canvas));
 
+        // Sync zoom slider/label when canvas zoom changes (via ctrl+scroll or keyboard)
+        let this_weak_zoom = self.self_weak.borrow().clone();
+        editor_canvas.set_on_zoom_changed(move |zoom| {
+            if let Some(this) = this_weak_zoom.upgrade() {
+                if let Some(ref scale) = *this.zoom_scale.borrow() {
+                    scale.set_value(zoom * 100.0);
+                }
+                if let Some(ref label) = *this.zoom_label.borrow() {
+                    label.set_text(&format!("{}%", (zoom * 100.0) as i32));
+                }
+            }
+        });
+
         // Register the on_changed callback once at tab creation, keyed to this page_num.
         // Do NOT re-register it on every resource select (that would create stale closures).
         let this_weak_for_cb = self.self_weak.borrow().clone();
@@ -675,6 +859,8 @@ impl MainWindow {
             tool_panel: Rc::clone(&tool_panel),
             current_resource_id: RefCell::new(None),
             has_saved_changes: RefCell::new(false),
+            main_paned: main_paned.clone(),
+            right_paned: right_paned.clone(),
         };
 
         self.tabs.borrow_mut().insert(page_num, tab);

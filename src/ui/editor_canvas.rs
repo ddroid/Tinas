@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{DrawingArea, EventControllerMotion, GestureDrag, GestureClick, Box, Orientation, ScrolledWindow};
+use gtk4::{DrawingArea, EventControllerMotion, EventControllerScroll, EventControllerKey, GestureDrag, GestureClick, Box, Orientation, ScrolledWindow};
 use cairo::ImageSurface;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -30,6 +30,8 @@ pub struct EditorCanvas {
     on_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(bool)>>>>,
     last_draw_time: Rc<RefCell<Instant>>,
     load_generation: Rc<RefCell<u64>>,
+    zoom_level: Rc<RefCell<f64>>,
+    on_zoom_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(f64)>>>>,
 }
 
 impl EditorCanvas {
@@ -70,6 +72,8 @@ impl EditorCanvas {
             on_changed: Rc::new(RefCell::new(None)),
             last_draw_time: Rc::new(RefCell::new(Instant::now())),
             load_generation: Rc::new(RefCell::new(0)),
+            zoom_level: Rc::new(RefCell::new(1.0)),
+            on_zoom_changed: Rc::new(RefCell::new(None)),
         };
         
         this.setup_drawing();
@@ -83,12 +87,18 @@ impl EditorCanvas {
         let overlay_surface = self.overlay_surface.clone();
         let hover_pos = self.hover_pos.clone();
         let current_tool = self.current_tool.clone();
+        let zoom_level = self.zoom_level.clone();
         
         self.drawing_area.set_draw_func(move |_area, ctx, _width, _height| {
+            let zoom = *zoom_level.borrow();
+
             // Clear background
             ctx.set_source_rgb(0.2, 0.2, 0.2);
             ctx.paint().expect("Failed to clear canvas");
             
+            // Apply zoom transform
+            ctx.scale(zoom, zoom);
+
             // Draw base surface (original image)
             let has_base = if let Some(ref surface) = *base_surface.borrow() {
                 ctx.set_source_surface(surface, 0.0, 0.0).ok();
@@ -115,6 +125,7 @@ impl EditorCanvas {
             }
 
             if let Some((x, y)) = *hover_pos.borrow() {
+                // hover_pos is already in image coordinates (divided by zoom)
                 match &*current_tool.borrow() {
                     Tool::Brush(brush) => draw_tool_preview(ctx, x, y, brush.size, brush.shape, Some(brush.color)),
                     Tool::Eraser(eraser) => draw_tool_preview(ctx, x, y, eraser.size, eraser.shape, None),
@@ -157,12 +168,15 @@ impl EditorCanvas {
         let last_pos_click = self.last_pos.clone();
         let hover_pos_drag_end = hover_pos.clone();
 
+        let zoom_level_motion = self.zoom_level.clone();
         let motion = EventControllerMotion::new();
         let hover_pos_motion = hover_pos.clone();
         let drawing_area_motion = drawing_area.clone();
         let last_draw_time_motion = self.last_draw_time.clone();
         motion.connect_motion(move |_controller, x, y| {
-            *hover_pos_motion.borrow_mut() = Some((x, y));
+            let zoom = *zoom_level_motion.borrow();
+            let (ix, iy) = (x / zoom, y / zoom);
+            *hover_pos_motion.borrow_mut() = Some((ix, iy));
             let now = Instant::now();
             let elapsed = now.duration_since(*last_draw_time_motion.borrow()).as_millis();
             if elapsed >= DRAW_THROTTLE_MS {
@@ -184,18 +198,25 @@ impl EditorCanvas {
         let drag = GestureDrag::new();
         drag.set_button(gtk4::gdk::BUTTON_PRIMARY);
         
+        let zoom_level_drag = self.zoom_level.clone();
         drag.connect_drag_begin(move |_gesture, x, y| {
+            let zoom = *zoom_level_drag.borrow();
+            let (ix, iy) = (x / zoom, y / zoom);
             *drag_happened.borrow_mut() = false;
             *last_pos.borrow_mut() = None;
-            *hover_pos.borrow_mut() = Some((x, y));
+            *hover_pos.borrow_mut() = Some((ix, iy));
 
             drawing_area.queue_draw();
         });
         
+        let zoom_level_drag_update = self.zoom_level.clone();
         drag.connect_drag_update(move |_gesture, offset_x, offset_y| {
             if let Some((start_x, start_y)) = _gesture.start_point() {
-                let current_x = start_x + offset_x;
-                let current_y = start_y + offset_y;
+                let zoom = *zoom_level_drag_update.borrow();
+                let current_x = (start_x + offset_x) / zoom;
+                let current_y = (start_y + offset_y) / zoom;
+                let start_x = start_x / zoom;
+                let start_y = start_y / zoom;
                 *hover_pos_clone.borrow_mut() = Some((current_x, current_y));
 
                 let drag_distance = ((current_x - start_x).powi(2) + (current_y - start_y).powi(2)).sqrt();
@@ -255,10 +276,12 @@ impl EditorCanvas {
 
         let last_pos_end = self.last_pos.clone();
         let drawing_area_end = self.drawing_area.clone();
+        let zoom_level_drag_end = self.zoom_level.clone();
         drag.connect_drag_end(move |_gesture, offset_x, offset_y| {
             if let Some((start_x, start_y)) = _gesture.start_point() {
-                let current_x = start_x + offset_x;
-                let current_y = start_y + offset_y;
+                let zoom = *zoom_level_drag_end.borrow();
+                let current_x = (start_x + offset_x) / zoom;
+                let current_y = (start_y + offset_y) / zoom;
                 *last_pos_end.borrow_mut() = None;
                 *hover_pos_drag_end.borrow_mut() = Some((current_x, current_y));
             } else {
@@ -273,7 +296,10 @@ impl EditorCanvas {
         let click = GestureClick::new();
         click.set_button(gtk4::gdk::BUTTON_PRIMARY);
         
+        let zoom_level_click = self.zoom_level.clone();
         click.connect_released(move |_gesture, _n_press, x, y| {
+            let zoom = *zoom_level_click.borrow();
+            let (ix, iy) = (x / zoom, y / zoom);
             let was_drag = *drag_happened_click.borrow();
             *drag_happened_click.borrow_mut() = false;
             *last_pos_click.borrow_mut() = None;
@@ -289,10 +315,10 @@ impl EditorCanvas {
 
                 match &*current_tool_click.borrow() {
                     Tool::Brush(brush) => {
-                        brush.draw(&ctx, x, y);
+                        brush.draw(&ctx, ix, iy);
                     }
                     Tool::Eraser(eraser) => {
-                        eraser.erase(&ctx, x, y);
+                        eraser.erase(&ctx, ix, iy);
                     }
                 }
                 
@@ -304,16 +330,109 @@ impl EditorCanvas {
                     }
                 }
 
-                *hover_pos_click.borrow_mut() = Some((x, y));
+                *hover_pos_click.borrow_mut() = Some((ix, iy));
                 drawing_area_click.queue_draw();
             }
         });
         
         self.drawing_area.add_controller(click);
+
+        // Ctrl+Scroll to zoom
+        let scroll_ctrl = EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        let zoom_level_scroll = self.zoom_level.clone();
+        let drawing_area_scroll = self.drawing_area.clone();
+        let base_surface_scroll = self.base_surface.clone();
+        let on_zoom_changed_scroll = self.on_zoom_changed.clone();
+        scroll_ctrl.connect_scroll(move |ctrl, _dx, dy| {
+            let state = ctrl.current_event_state();
+            if !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                return gtk4::glib::Propagation::Proceed;
+            }
+            let mut zoom = *zoom_level_scroll.borrow();
+            if dy < 0.0 {
+                zoom = (zoom * 1.1).min(10.0);
+            } else {
+                zoom = (zoom / 1.1).max(0.1);
+            }
+            *zoom_level_scroll.borrow_mut() = zoom;
+            if let Some(ref surface) = *base_surface_scroll.borrow() {
+                let w = (surface.width() as f64 * zoom).ceil() as i32;
+                let h = (surface.height() as f64 * zoom).ceil() as i32;
+                drawing_area_scroll.set_content_width(w);
+                drawing_area_scroll.set_content_height(h);
+            }
+            drawing_area_scroll.queue_draw();
+            if let Some(ref cb) = *on_zoom_changed_scroll.borrow() {
+                cb(zoom);
+            }
+            gtk4::glib::Propagation::Stop
+        });
+        self.drawing_area.add_controller(scroll_ctrl);
+
+        // Ctrl+Plus / Ctrl+Minus keyboard zoom
+        let key_ctrl = EventControllerKey::new();
+        let zoom_level_key = self.zoom_level.clone();
+        let drawing_area_key = self.drawing_area.clone();
+        let base_surface_key = self.base_surface.clone();
+        let on_zoom_changed_key = self.on_zoom_changed.clone();
+        key_ctrl.connect_key_pressed(move |_ctrl, key, _code, state| {
+            if !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                return gtk4::glib::Propagation::Proceed;
+            }
+            let mut zoom = *zoom_level_key.borrow();
+            match key {
+                gtk4::gdk::Key::plus | gtk4::gdk::Key::equal | gtk4::gdk::Key::KP_Add => {
+                    zoom = (zoom * 1.2).min(10.0);
+                }
+                gtk4::gdk::Key::minus | gtk4::gdk::Key::KP_Subtract => {
+                    zoom = (zoom / 1.2).max(0.1);
+                }
+                gtk4::gdk::Key::_0 | gtk4::gdk::Key::KP_0 => {
+                    zoom = 1.0;
+                }
+                _ => return gtk4::glib::Propagation::Proceed,
+            }
+            *zoom_level_key.borrow_mut() = zoom;
+            if let Some(ref surface) = *base_surface_key.borrow() {
+                let w = (surface.width() as f64 * zoom).ceil() as i32;
+                let h = (surface.height() as f64 * zoom).ceil() as i32;
+                drawing_area_key.set_content_width(w);
+                drawing_area_key.set_content_height(h);
+            }
+            drawing_area_key.queue_draw();
+            if let Some(ref cb) = *on_zoom_changed_key.borrow() {
+                cb(zoom);
+            }
+            gtk4::glib::Propagation::Stop
+        });
+        self.drawing_area.add_controller(key_ctrl);
     }
     
     pub fn widget(&self) -> &ScrolledWindow {
         &self.container
+    }
+
+    pub fn set_zoom(&self, zoom: f64) {
+        let zoom = zoom.clamp(0.1, 10.0);
+        *self.zoom_level.borrow_mut() = zoom;
+        if let Some(ref surface) = *self.base_surface.borrow() {
+            let w = (surface.width() as f64 * zoom).ceil() as i32;
+            let h = (surface.height() as f64 * zoom).ceil() as i32;
+            self.drawing_area.set_content_width(w);
+            self.drawing_area.set_content_height(h);
+        }
+        self.drawing_area.queue_draw();
+        if let Some(ref cb) = *self.on_zoom_changed.borrow() {
+            cb(zoom);
+        }
+    }
+
+    pub fn get_zoom(&self) -> f64 {
+        *self.zoom_level.borrow()
+    }
+
+    pub fn set_on_zoom_changed<F: Fn(f64) + 'static>(&self, callback: F) {
+        *self.on_zoom_changed.borrow_mut() = Some(std::boxed::Box::new(callback));
     }
     
     fn apply_surface_data(&self, cairo_data: Vec<u8>, width: i32, height: i32, stride: i32) {
@@ -361,6 +480,12 @@ impl EditorCanvas {
             callback(false);
         }
         
+        // Reset zoom to 1.0 for each new image
+        *self.zoom_level.borrow_mut() = 1.0;
+        if let Some(ref cb) = *self.on_zoom_changed.borrow() {
+            cb(1.0);
+        }
+
         self.drawing_area.set_content_width(width);
         self.drawing_area.set_content_height(height);
         println!("[SET BASE IMAGE] Drawing area size set to {}x{}", width, height);

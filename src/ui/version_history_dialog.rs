@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{Box, Button, Dialog, Label, ListBox, ListBoxRow, Orientation, Picture, ScrolledWindow};
+use gtk4::{Box, Button, Dialog, Label, ListBox, ListBoxRow, Orientation, Picture, ScrolledWindow, GestureDrag};
 use std::rc::Rc;
 use std::cell::RefCell;
 
@@ -24,7 +24,7 @@ impl VersionHistoryDialog {
     ) -> Self {
         let dialog = Dialog::new();
         dialog.set_title(Some(&format!("Version History - Resource {}", resource_id)));
-        dialog.set_default_size(500, 400);
+        dialog.set_default_size(600, 500);
         dialog.set_modal(true);
         dialog.set_transient_for(Some(parent));
         
@@ -142,17 +142,42 @@ impl VersionHistoryDialog {
         
         hbox.append(&info_box);
         
-        // Preview thumbnail if possible
-        // Try to load the image data as a Pixbuf
+        // Preview thumbnail in a scrollable + draggable container
         let bytes = glib::Bytes::from(&version.image_data);
         let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
         if let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE) {
-            // Convert Pixbuf to Texture (which implements Paintable)
             let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
             let picture = Picture::for_paintable(&texture);
-            picture.set_size_request(64, 64);
             picture.set_can_shrink(false);
-            hbox.append(&picture);
+
+            let img_scroll = ScrolledWindow::builder()
+                .hscrollbar_policy(gtk4::PolicyType::Automatic)
+                .vscrollbar_policy(gtk4::PolicyType::Automatic)
+                .build();
+            img_scroll.set_size_request(120, 90);
+            img_scroll.set_child(Some(&picture));
+
+            // Drag-to-scroll
+            let drag = GestureDrag::new();
+            let scroll_ref = img_scroll.clone();
+            let drag_start = Rc::new(RefCell::new((0.0_f64, 0.0_f64)));
+            let drag_start_begin = drag_start.clone();
+            drag.connect_drag_begin(move |_gesture, _x, _y| {
+                let hadj = scroll_ref.hadjustment();
+                let vadj = scroll_ref.vadjustment();
+                *drag_start_begin.borrow_mut() = (hadj.value(), vadj.value());
+            });
+            let scroll_ref2 = img_scroll.clone();
+            drag.connect_drag_update(move |_gesture, offset_x, offset_y| {
+                let (start_h, start_v) = *drag_start.borrow();
+                let hadj = scroll_ref2.hadjustment();
+                let vadj = scroll_ref2.vadjustment();
+                hadj.set_value(start_h - offset_x);
+                vadj.set_value(start_v - offset_y);
+            });
+            img_scroll.add_controller(drag);
+
+            hbox.append(&img_scroll);
         }
         
         // Restore button (if not current)
