@@ -3,9 +3,12 @@ use gtk4::{DrawingArea, EventControllerMotion, GestureDrag, GestureClick, Box, O
 use cairo::ImageSurface;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::editor::brush::{Brush, BrushShape, Eraser};
 use crate::editor::history::History;
+
+const DRAW_THROTTLE_MS: u128 = 16; // ~60fps max redraw rate for hover preview
 
 pub enum Tool {
     Brush(Brush),
@@ -22,9 +25,11 @@ pub struct EditorCanvas {
     last_pos: Rc<RefCell<Option<(f64, f64)>>>,
     hover_pos: Rc<RefCell<Option<(f64, f64)>>>,
     drag_happened: Rc<RefCell<bool>>,
-    original_dimensions: RefCell<Option<(u32, u32)>>,
+    original_dimensions: Rc<RefCell<Option<(u32, u32)>>>,
     has_changes: Rc<RefCell<bool>>,
     on_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(bool)>>>>,
+    last_draw_time: Rc<RefCell<Instant>>,
+    load_generation: Rc<RefCell<u64>>,
 }
 
 impl EditorCanvas {
@@ -60,9 +65,11 @@ impl EditorCanvas {
             last_pos: Rc::new(RefCell::new(None)),
             hover_pos: Rc::new(RefCell::new(None)),
             drag_happened: Rc::new(RefCell::new(false)),
-            original_dimensions: RefCell::new(None),
+            original_dimensions: Rc::new(RefCell::new(None)),
             has_changes: Rc::new(RefCell::new(false)),
             on_changed: Rc::new(RefCell::new(None)),
+            last_draw_time: Rc::new(RefCell::new(Instant::now())),
+            load_generation: Rc::new(RefCell::new(0)),
         };
         
         this.setup_drawing();
@@ -83,11 +90,24 @@ impl EditorCanvas {
             ctx.paint().expect("Failed to clear canvas");
             
             // Draw base surface (original image)
-            if let Some(ref surface) = *base_surface.borrow() {
+            let has_base = if let Some(ref surface) = *base_surface.borrow() {
                 ctx.set_source_surface(surface, 0.0, 0.0).ok();
                 ctx.paint().ok();
-            }
+                true
+            } else {
+                // Show loading indicator while async image decode is in progress
+                ctx.set_source_rgb(0.6, 0.6, 0.6);
+                ctx.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
+                ctx.set_font_size(14.0);
+                ctx.move_to(20.0, 50.0);
+                let _ = ctx.show_text("Loading...");
+                false
+            };
             
+            if !has_base {
+                return;
+            }
+
             // Draw overlay surface (user edits)
             if let Some(ref surface) = *overlay_surface.borrow() {
                 ctx.set_source_surface(surface, 0.0, 0.0).ok();
@@ -140,9 +160,15 @@ impl EditorCanvas {
         let motion = EventControllerMotion::new();
         let hover_pos_motion = hover_pos.clone();
         let drawing_area_motion = drawing_area.clone();
+        let last_draw_time_motion = self.last_draw_time.clone();
         motion.connect_motion(move |_controller, x, y| {
             *hover_pos_motion.borrow_mut() = Some((x, y));
-            drawing_area_motion.queue_draw();
+            let now = Instant::now();
+            let elapsed = now.duration_since(*last_draw_time_motion.borrow()).as_millis();
+            if elapsed >= DRAW_THROTTLE_MS {
+                *last_draw_time_motion.borrow_mut() = now;
+                drawing_area_motion.queue_draw();
+            }
         });
 
         let hover_pos_leave = hover_pos.clone();
@@ -290,48 +316,7 @@ impl EditorCanvas {
         &self.container
     }
     
-    pub fn set_base_image(&self, image: &image::DynamicImage) {
-        let (width, height) = (image.width() as i32, image.height() as i32);
-        println!("[SET BASE IMAGE] Setting image {}x{}", width, height);
-        
-        // Store original dimensions for export
-        *self.original_dimensions.borrow_mut() = Some((image.width(), image.height()));
-        
-        // Convert image to cairo surface using create_for_data with proper stride
-        let stride = cairo::Format::ARgb32.stride_for_width(width as u32).expect("Invalid width");
-        println!("[SET BASE IMAGE] Calculated stride: {} for width {}", stride, width);
-        
-        // Convert DynamicImage to RGBA buffer and draw to surface
-        let rgba = image.to_rgba8();
-        let img_data = rgba.as_raw();
-        
-        // Create a buffer with Cairo's ARGB32 format (BGRA premultiplied)
-        // Use stride (row bytes) which may be larger than width * 4 due to alignment
-        let mut cairo_data = vec![0u8; (stride * height) as usize];
-        
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                let src_offset = (y * width as usize + x) * 4;
-                let dst_offset = (y * stride as usize) + (x * 4);
-                
-                let r = img_data[src_offset] as u32;
-                let g = img_data[src_offset + 1] as u32;
-                let b = img_data[src_offset + 2] as u32;
-                let a = img_data[src_offset + 3] as u32;
-                
-                // Premultiply alpha for ARGB32
-                let premul_r = (r * a / 255) as u8;
-                let premul_g = (g * a / 255) as u8;
-                let premul_b = (b * a / 255) as u8;
-                
-                // Cairo ARGB32 format: B, G, R, A in native endian
-                cairo_data[dst_offset] = premul_b;
-                cairo_data[dst_offset + 1] = premul_g;
-                cairo_data[dst_offset + 2] = premul_r;
-                cairo_data[dst_offset + 3] = a as u8;
-            }
-        }
-        
+    fn apply_surface_data(&self, cairo_data: Vec<u8>, width: i32, height: i32, stride: i32) {
         // Create surface from data buffer
         let surface = ImageSurface::create_for_data(
             cairo_data,
@@ -358,8 +343,16 @@ impl EditorCanvas {
         *self.overlay_surface.borrow_mut() = Some(overlay);
         println!("[SET BASE IMAGE] Overlay surface created and stored");
         
-        // Clear history and changes
-        self.history.borrow_mut().clear();
+        // Adapt history depth for large images to avoid excessive memory usage
+        let pixel_count = (width as u64) * (height as u64);
+        let max_history = if pixel_count > 2_000_000 {
+            15  // ~1080p+: ~120MB max
+        } else if pixel_count > 500_000 {
+            30  // medium images
+        } else {
+            50  // small images
+        };
+        *self.history.borrow_mut() = History::new(max_history);
         *self.last_pos.borrow_mut() = None;
         *self.hover_pos.borrow_mut() = None;
         *self.drag_happened.borrow_mut() = false;
@@ -373,6 +366,187 @@ impl EditorCanvas {
         println!("[SET BASE IMAGE] Drawing area size set to {}x{}", width, height);
         self.drawing_area.queue_draw();
         println!("[SET BASE IMAGE] queue_draw() called");
+    }
+
+    /// Convert RGBA image data to Cairo BGRA premultiplied format.
+    /// This is the CPU-heavy part that can be done off the main thread.
+    fn convert_rgba_to_cairo(image: &image::DynamicImage) -> (Vec<u8>, i32, i32, i32) {
+        let (width, height) = (image.width() as i32, image.height() as i32);
+        let stride = cairo::Format::ARgb32.stride_for_width(width as u32).expect("Invalid width");
+        let rgba = image.to_rgba8();
+        let img_data = rgba.as_raw();
+        
+        let mut cairo_data = vec![0u8; (stride * height) as usize];
+        let row_bytes = width as usize * 4;
+        let stride_usize = stride as usize;
+        
+        for y in 0..height as usize {
+            let src_row = &img_data[y * row_bytes..(y * row_bytes + row_bytes)];
+            let dst_row = &mut cairo_data[y * stride_usize..y * stride_usize + row_bytes];
+            for (src_px, dst_px) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
+                let r = src_px[0] as u32;
+                let g = src_px[1] as u32;
+                let b = src_px[2] as u32;
+                let a = src_px[3] as u32;
+                dst_px[0] = (b * a / 255) as u8;
+                dst_px[1] = (g * a / 255) as u8;
+                dst_px[2] = (r * a / 255) as u8;
+                dst_px[3] = a as u8;
+            }
+        }
+        
+        (cairo_data, width, height, stride)
+    }
+
+    pub fn set_base_image(&self, image: &image::DynamicImage) {
+        let (width, height) = (image.width() as i32, image.height() as i32);
+        println!("[SET BASE IMAGE] Setting image {}x{}", width, height);
+        
+        // Store original dimensions for export
+        *self.original_dimensions.borrow_mut() = Some((image.width(), image.height()));
+        
+        let stride = cairo::Format::ARgb32.stride_for_width(width as u32).expect("Invalid width");
+        println!("[SET BASE IMAGE] Calculated stride: {} for width {}", stride, width);
+        
+        let (cairo_data, w, h, s) = Self::convert_rgba_to_cairo(image);
+        self.apply_surface_data(cairo_data, w, h, s);
+    }
+
+    /// Asynchronously decode image bytes and set the base image without blocking the UI.
+    /// For small images (<500K pixels), falls back to synchronous loading.
+    pub fn set_base_image_async(&self, data: Vec<u8>) {
+        // Bump generation to invalidate any in-flight async loads
+        let current_gen = {
+            let mut g = self.load_generation.borrow_mut();
+            *g += 1;
+            *g
+        };
+
+        // Quick peek at image dimensions to decide sync vs async
+        let needs_async = image::ImageReader::new(std::io::Cursor::new(&data))
+            .with_guessed_format()
+            .ok()
+            .and_then(|r| r.into_dimensions().ok())
+            .map(|(w, h)| (w as u64) * (h as u64) > 500_000)
+            .unwrap_or(false);
+
+        if !needs_async {
+            // Small image: decode synchronously (fast enough)
+            match image::load_from_memory(&data) {
+                Ok(img) => {
+                    let (w, h) = (img.width(), img.height());
+                    println!("[DEBUG] Image loaded successfully: {}x{}", w, h);
+                    *self.original_dimensions.borrow_mut() = Some((w, h));
+                    let (cairo_data, cw, ch, cs) = Self::convert_rgba_to_cairo(&img);
+                    self.apply_surface_data(cairo_data, cw, ch, cs);
+                    println!("[DEBUG] Image set to canvas");
+                }
+                Err(e) => eprintln!("[DEBUG] Failed to load image: {}", e),
+            }
+            return;
+        }
+
+        // Large image: show loading placeholder immediately, then process in background
+        self.show_loading();
+
+        let load_generation = Rc::clone(&self.load_generation);
+        let base_surface = Rc::clone(&self.base_surface);
+        let overlay_surface = Rc::clone(&self.overlay_surface);
+        let history = Rc::clone(&self.history);
+        let last_pos = Rc::clone(&self.last_pos);
+        let hover_pos = Rc::clone(&self.hover_pos);
+        let drag_happened = Rc::clone(&self.drag_happened);
+        let has_changes = Rc::clone(&self.has_changes);
+        let on_changed = Rc::clone(&self.on_changed);
+        let drawing_area = self.drawing_area.clone();
+        let original_dimensions = Rc::clone(&self.original_dimensions);
+
+        // Use spawn_future_local so the Rc values stay on the main thread.
+        // The heavy decode+convert work runs on a blocking thread pool via gio::spawn_blocking.
+        glib::spawn_future_local(async move {
+            let result = gtk4::gio::spawn_blocking(move || {
+                match image::load_from_memory(&data) {
+                    Ok(img) => {
+                        let (w, h) = (img.width(), img.height());
+                        println!("[ASYNC] Image decoded: {}x{}", w, h);
+                        let (cairo_data, cw, ch, cs) = Self::convert_rgba_to_cairo(&img);
+                        Some((cairo_data, cw, ch, cs, w, h))
+                    }
+                    Err(e) => {
+                        eprintln!("[ASYNC] Failed to decode image: {}", e);
+                        None
+                    }
+                }
+            }).await;
+
+            let Some(Some((cairo_data, width, height, stride, orig_w, orig_h))) = result.ok() else {
+                return;
+            };
+
+            // Check if this load is still current
+            if *load_generation.borrow() != current_gen {
+                println!("[ASYNC] Stale load discarded (gen {} vs current {})", current_gen, *load_generation.borrow());
+                return;
+            }
+
+            println!("[ASYNC] Applying surface {}x{}", width, height);
+
+            *original_dimensions.borrow_mut() = Some((orig_w, orig_h));
+
+            // Create base surface
+            let surface = ImageSurface::create_for_data(
+                cairo_data,
+                cairo::Format::ARgb32,
+                width,
+                height,
+                stride,
+            ).expect("Failed to create surface from data");
+            *base_surface.borrow_mut() = Some(surface);
+
+            // Create overlay surface
+            let overlay_stride = cairo::Format::ARgb32.stride_for_width(width as u32).unwrap();
+            let overlay_data_buf = vec![0u8; (overlay_stride * height) as usize];
+            let overlay = ImageSurface::create_for_data(
+                overlay_data_buf,
+                cairo::Format::ARgb32,
+                width,
+                height,
+                overlay_stride,
+            ).expect("Failed to create overlay surface");
+            *overlay_surface.borrow_mut() = Some(overlay);
+
+            // Adapt history
+            let pixel_count = (width as u64) * (height as u64);
+            let max_history = if pixel_count > 2_000_000 {
+                15
+            } else if pixel_count > 500_000 {
+                30
+            } else {
+                50
+            };
+            *history.borrow_mut() = History::new(max_history);
+            *last_pos.borrow_mut() = None;
+            *hover_pos.borrow_mut() = None;
+            *drag_happened.borrow_mut() = false;
+            *has_changes.borrow_mut() = false;
+            if let Some(ref callback) = *on_changed.borrow() {
+                callback(false);
+            }
+
+            drawing_area.set_content_width(width);
+            drawing_area.set_content_height(height);
+            drawing_area.queue_draw();
+            println!("[ASYNC] Image applied to canvas");
+        });
+    }
+
+    /// Show a loading placeholder while an image is being decoded asynchronously.
+    fn show_loading(&self) {
+        *self.base_surface.borrow_mut() = None;
+        *self.overlay_surface.borrow_mut() = None;
+        self.drawing_area.set_content_width(200);
+        self.drawing_area.set_content_height(100);
+        self.drawing_area.queue_draw();
     }
     
     pub fn clear_overlay(&self) {
@@ -516,30 +690,20 @@ impl EditorCanvas {
         let height = base_surf.height();
         println!("[COMPOSITE] surfaces: {}x{}, orig: {}x{}", width, height, orig_w, orig_h);
         
-        // Create a new image to composite both layers
-        let composite = surface_to_rgba_image(base_surf);
-        if composite.is_none() {
-            println!("[COMPOSITE] FAIL: surface_to_rgba_image(base) returned None");
-            return None;
+        // Use cairo to composite base + overlay (GPU-accelerated, much faster than per-pixel)
+        let composite_surface = ImageSurface::create(cairo::Format::ARgb32, width, height)
+            .expect("Failed to create composite surface");
+        {
+            let ctx = cairo::Context::new(&composite_surface).expect("Failed to create context");
+            ctx.set_source_surface(base_surf, 0.0, 0.0).ok()?;
+            ctx.paint().ok()?;
+            ctx.set_source_surface(overlay_surf, 0.0, 0.0).ok()?;
+            ctx.paint().ok()?;
         }
-        let mut composite = composite.unwrap();
-        let overlay_image = surface_to_rgba_image(overlay_surf);
-        if overlay_image.is_none() {
-            println!("[COMPOSITE] FAIL: surface_to_rgba_image(overlay) returned None");
-            return None;
-        }
-        let overlay_image = overlay_image.unwrap();
-
-        for y in 0..height as u32 {
-            for x in 0..width as u32 {
-                let overlay_pixel = overlay_image.get_pixel(x, y);
-                if overlay_pixel[3] > 0 {
-                    let base_pixel = composite.get_pixel(x, y);
-                    let blended = blend_pixels(*base_pixel, *overlay_pixel);
-                    composite.put_pixel(x, y, blended);
-                }
-            }
-        }
+        composite_surface.flush();
+        
+        // Convert composited surface to RGBA image
+        let composite = surface_to_rgba_image(&composite_surface)?;
         
         // Resize to original dimensions if needed
         let mut img = image::DynamicImage::ImageRgba8(composite);
@@ -648,6 +812,7 @@ fn surface_to_rgba_image(surface: &ImageSurface) -> Option<image::RgbaImage> {
     copy.flush();
 
     let stride = copy.stride() as usize;
+    let row_bytes = width as usize * 4;
     let data: Vec<u8> = {
         match copy.data() {
             Ok(d) => d.to_vec(),
@@ -658,32 +823,27 @@ fn surface_to_rgba_image(surface: &ImageSurface) -> Option<image::RgbaImage> {
         }
     };
 
-    let mut image = image::RgbaImage::new(width, height);
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
 
     for y in 0..height as usize {
-        for x in 0..width as usize {
-            let offset = y * stride + x * 4;
-            let b = data[offset] as u32;
-            let g = data[offset + 1] as u32;
-            let r = data[offset + 2] as u32;
-            let a = data[offset + 3] as u32;
-
-            let rgba = if a > 0 {
-                image::Rgba([
-                    ((r * 255) / a).min(255) as u8,
-                    ((g * 255) / a).min(255) as u8,
-                    ((b * 255) / a).min(255) as u8,
-                    a as u8,
-                ])
-            } else {
-                image::Rgba([0, 0, 0, 0])
-            };
-
-            image.put_pixel(x as u32, y as u32, rgba);
+        let src_row = &data[y * stride..y * stride + row_bytes];
+        let dst_row = &mut pixels[y * row_bytes..y * row_bytes + row_bytes];
+        for (src_px, dst_px) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
+            let b = src_px[0] as u32;
+            let g = src_px[1] as u32;
+            let r = src_px[2] as u32;
+            let a = src_px[3] as u32;
+            if a > 0 {
+                dst_px[0] = ((r * 255) / a).min(255) as u8;
+                dst_px[1] = ((g * 255) / a).min(255) as u8;
+                dst_px[2] = ((b * 255) / a).min(255) as u8;
+                dst_px[3] = a as u8;
+            }
+            // else: already zero-initialized
         }
     }
 
-    Some(image)
+    image::RgbaImage::from_raw(width, height, pixels)
 }
 
 impl Default for EditorCanvas {

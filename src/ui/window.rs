@@ -710,21 +710,8 @@ impl MainWindow {
 
                         if let Some(data) = this.get_resource_image_data(tab, resource.id) {
                             println!("[DEBUG] Attempting to load image from {} bytes", data.len());
-
-                            match image::load_from_memory(&data) {
-                                Ok(img) => {
-                                    let (w, h) = (img.width(), img.height());
-                                    println!("[DEBUG] Image loaded successfully: {}x{}", w, h);
-                                    canvas.set_base_image(&img);
-                                    println!("[DEBUG] Image set to canvas");
-
-                                    // Update toolbar immediately to reflect the cleared has_changes state.
-                                    this.update_toolbar_buttons(tab);
-                                }
-                                Err(e) => {
-                                    eprintln!("[DEBUG] Failed to load image: {}", e);
-                                }
-                            }
+                            canvas.set_base_image_async(data);
+                            this.update_toolbar_buttons(tab);
                         }
 
                         *tab.current_resource_id.borrow_mut() = Some(resource.id);
