@@ -19,11 +19,11 @@ pub struct EditorCanvas {
     overlay_surface: Rc<RefCell<Option<ImageSurface>>>,
     current_tool: Rc<RefCell<Tool>>,
     history: Rc<RefCell<History>>,
-    last_pos: RefCell<Option<(f64, f64)>>,
+    last_pos: Rc<RefCell<Option<(f64, f64)>>>,
     hover_pos: Rc<RefCell<Option<(f64, f64)>>>,
     drag_happened: Rc<RefCell<bool>>,
     original_dimensions: RefCell<Option<(u32, u32)>>,
-    has_changes: RefCell<bool>,
+    has_changes: Rc<RefCell<bool>>,
     on_changed: Rc<RefCell<Option<std::boxed::Box<dyn Fn(bool)>>>>,
 }
 
@@ -57,11 +57,11 @@ impl EditorCanvas {
             overlay_surface: Rc::new(RefCell::new(None)),
             current_tool: Rc::new(RefCell::new(Tool::Brush(Brush::new(8.0, (1.0, 0.0, 0.0, 1.0))))),
             history: Rc::new(RefCell::new(History::new(50))),
-            last_pos: RefCell::new(None),
+            last_pos: Rc::new(RefCell::new(None)),
             hover_pos: Rc::new(RefCell::new(None)),
             drag_happened: Rc::new(RefCell::new(false)),
             original_dimensions: RefCell::new(None),
-            has_changes: RefCell::new(false),
+            has_changes: Rc::new(RefCell::new(false)),
             on_changed: Rc::new(RefCell::new(None)),
         };
         
@@ -498,17 +498,37 @@ impl EditorCanvas {
         
         let (base_surf, overlay_surf) = match (&*base, &*overlay) {
             (Some(b), Some(o)) => (b, o),
-            _ => return None,
+            _ => {
+                println!("[COMPOSITE] FAIL: base={} overlay={}", base.is_some(), overlay.is_some());
+                return None;
+            }
         };
         
-        let (orig_w, orig_h) = dimensions.as_ref()?;
+        let (orig_w, orig_h) = match dimensions.as_ref() {
+            Some(d) => d,
+            None => {
+                println!("[COMPOSITE] FAIL: original_dimensions is None");
+                return None;
+            }
+        };
         
         let width = base_surf.width();
         let height = base_surf.height();
+        println!("[COMPOSITE] surfaces: {}x{}, orig: {}x{}", width, height, orig_w, orig_h);
         
         // Create a new image to composite both layers
-        let mut composite = surface_to_rgba_image(base_surf)?;
-        let overlay_image = surface_to_rgba_image(overlay_surf)?;
+        let composite = surface_to_rgba_image(base_surf);
+        if composite.is_none() {
+            println!("[COMPOSITE] FAIL: surface_to_rgba_image(base) returned None");
+            return None;
+        }
+        let mut composite = composite.unwrap();
+        let overlay_image = surface_to_rgba_image(overlay_surf);
+        if overlay_image.is_none() {
+            println!("[COMPOSITE] FAIL: surface_to_rgba_image(overlay) returned None");
+            return None;
+        }
+        let overlay_image = overlay_image.unwrap();
 
         for y in 0..height as u32 {
             for x in 0..width as u32 {
@@ -548,6 +568,14 @@ impl EditorCanvas {
             if let Some(ref callback) = *self.on_changed.borrow() {
                 callback(true);
             }
+        }
+    }
+
+    /// Clear the unsaved-changes flag without discarding the undo history.
+    pub fn mark_saved(&self) {
+        *self.has_changes.borrow_mut() = false;
+        if let Some(ref callback) = *self.on_changed.borrow() {
+            callback(false);
         }
     }
 }
@@ -605,11 +633,29 @@ fn draw_tool_preview(
 fn surface_to_rgba_image(surface: &ImageSurface) -> Option<image::RgbaImage> {
     let width = surface.width() as u32;
     let height = surface.height() as u32;
-    let stride = surface.stride() as usize;
 
+    surface.flush();
+
+    // Copy to a new owned surface to avoid NonExclusive errors
+    // from surfaces created with create_for_data.
+    let mut copy = ImageSurface::create(cairo::Format::ARgb32, width as i32, height as i32)
+        .expect("Failed to create copy surface");
+    {
+        let ctx = cairo::Context::new(&copy).expect("Failed to create context");
+        ctx.set_source_surface(surface, 0.0, 0.0).ok()?;
+        ctx.paint().ok()?;
+    }
+    copy.flush();
+
+    let stride = copy.stride() as usize;
     let data: Vec<u8> = {
-        let mut surface_clone = surface.clone();
-        surface_clone.data().ok()?.to_vec()
+        match copy.data() {
+            Ok(d) => d.to_vec(),
+            Err(e) => {
+                println!("[SURFACE] data() FAILED even on copy: {:?} (surface {}x{}, stride={})", e, width, height, stride);
+                return None;
+            }
+        }
     };
 
     let mut image = image::RgbaImage::new(width, height);

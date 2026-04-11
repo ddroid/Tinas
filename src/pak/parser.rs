@@ -83,16 +83,14 @@ fn parse_version4(file: &mut fs::File, version: u32) -> Result<PakFile> {
         
         eprintln!("[PAK DEBUG] V4 Entry {}: id={}, offset={}", i, id, offset);
         
-        // Only add entries with valid IDs (skip sentinel with id=0 if present)
-        if id != 0 || i < num_resources {
-            resources.push((id, offset));
-        }
+        // Always push including sentinel — needed for last resource's size boundary
+        resources.push((id, offset));
     }
 
     // Get file size for calculating resource sizes
     let file_size = file.seek(SeekFrom::End(0))?;
 
-    // Convert to Resource structs
+    // Convert to Resource structs (keep ALL entries including zero-length ones)
     let mut resource_vec = Vec::new();
     for i in 0..resources.len().saturating_sub(1) {
         let (id, offset) = resources[i];
@@ -104,26 +102,33 @@ fn parse_version4(file: &mut fs::File, version: u32) -> Result<PakFile> {
             0
         };
 
-        // Read the resource data
-        if data_size > 0 && data_size < 100_000_000 {
-            let mut data = vec![0u8; data_size];
+        if data_size > 100_000_000 {
+            eprintln!("[PAK DEBUG] Warning: Skipping resource {} with absurd size {}", id, data_size);
+            continue;
+        }
+
+        let data = if data_size > 0 {
+            let mut buf = vec![0u8; data_size];
             file.seek(SeekFrom::Start(offset as u64))?;
-            if let Err(e) = file.read_exact(&mut data) {
+            if let Err(e) = file.read_exact(&mut buf) {
                 eprintln!("[PAK DEBUG] Warning: Could not read resource {}: {}", id, e);
                 continue;
             }
-            
-            let mut resource = Resource {
-                id,
-                offset,
-                data,
-                width: None,
-                height: None,
-                format: None,
-            };
-            let _ = resource.parse_image_dimensions();
-            resource_vec.push(resource);
-        }
+            buf
+        } else {
+            Vec::new()
+        };
+
+        let mut resource = Resource {
+            id,
+            offset,
+            data,
+            width: None,
+            height: None,
+            format: None,
+        };
+        let _ = resource.parse_image_dimensions();
+        resource_vec.push(resource);
     }
 
     eprintln!("[PAK DEBUG] V4: Loaded {} resources", resource_vec.len());
@@ -171,9 +176,8 @@ fn parse_version5(file: &mut fs::File, version: u32) -> Result<PakFile> {
         
         eprintln!("[PAK DEBUG] V5 Entry {}: id={}, offset={}", i, id, offset);
         
-        if id != 0 || i < num_resources {
-            resources.push((id, offset));
-        }
+        // Always push including sentinel — needed for last resource's size boundary
+        resources.push((id, offset));
     }
 
     // Read aliases
@@ -191,7 +195,7 @@ fn parse_version5(file: &mut fs::File, version: u32) -> Result<PakFile> {
     // Get file size
     let file_size = file.seek(SeekFrom::End(0))?;
 
-    // Convert to Resource structs
+    // Convert to Resource structs (keep ALL entries including zero-length ones)
     let mut resource_vec = Vec::new();
     for i in 0..resources.len().saturating_sub(1) {
         let (id, offset) = resources[i];
@@ -203,25 +207,33 @@ fn parse_version5(file: &mut fs::File, version: u32) -> Result<PakFile> {
             0
         };
 
-        if data_size > 0 && data_size < 100_000_000 {
-            let mut data = vec![0u8; data_size];
+        if data_size > 100_000_000 {
+            eprintln!("[PAK DEBUG] Warning: Skipping resource {} with absurd size {}", id, data_size);
+            continue;
+        }
+
+        let data = if data_size > 0 {
+            let mut buf = vec![0u8; data_size];
             file.seek(SeekFrom::Start(offset as u64))?;
-            if let Err(e) = file.read_exact(&mut data) {
+            if let Err(e) = file.read_exact(&mut buf) {
                 eprintln!("[PAK DEBUG] Warning: Could not read resource {}: {}", id, e);
                 continue;
             }
-            
-            let mut resource = Resource {
-                id,
-                offset,
-                data,
-                width: None,
-                height: None,
-                format: None,
-            };
-            let _ = resource.parse_image_dimensions();
-            resource_vec.push(resource);
-        }
+            buf
+        } else {
+            Vec::new()
+        };
+
+        let mut resource = Resource {
+            id,
+            offset,
+            data,
+            width: None,
+            height: None,
+            format: None,
+        };
+        let _ = resource.parse_image_dimensions();
+        resource_vec.push(resource);
     }
 
     eprintln!("[PAK DEBUG] V5: Loaded {} resources, {} aliases", resource_vec.len(), aliases.len());
@@ -256,9 +268,8 @@ fn parse_version_legacy(file: &mut fs::File, version: u32) -> Result<PakFile> {
         let id = file.read_u16::<LittleEndian>()?;
         let offset = file.read_u32::<LittleEndian>()?;
         
-        if id != 0 || i < num_resources {
-            resources.push((id, offset));
-        }
+        // Always push including sentinel — needed for last resource's size boundary
+        resources.push((id, offset));
     }
 
     let file_size = file.seek(SeekFrom::End(0))?;
@@ -274,24 +285,31 @@ fn parse_version_legacy(file: &mut fs::File, version: u32) -> Result<PakFile> {
             0
         };
 
-        if data_size > 0 && data_size < 100_000_000 {
-            let mut data = vec![0u8; data_size];
+        if data_size > 100_000_000 {
+            continue;
+        }
+
+        let data = if data_size > 0 {
+            let mut buf = vec![0u8; data_size];
             file.seek(SeekFrom::Start(offset as u64))?;
-            if let Err(e) = file.read_exact(&mut data) {
+            if file.read_exact(&mut buf).is_err() {
                 continue;
             }
-            
-            let mut resource = Resource {
-                id,
-                offset,
-                data,
-                width: None,
-                height: None,
-                format: None,
-            };
-            let _ = resource.parse_image_dimensions();
-            resource_vec.push(resource);
-        }
+            buf
+        } else {
+            Vec::new()
+        };
+
+        let mut resource = Resource {
+            id,
+            offset,
+            data,
+            width: None,
+            height: None,
+            format: None,
+        };
+        let _ = resource.parse_image_dimensions();
+        resource_vec.push(resource);
     }
 
     eprintln!("[PAK DEBUG] Legacy: Loaded {} resources", resource_vec.len());
@@ -347,22 +365,31 @@ fn parse_data_pack(file: &mut fs::File, version: u32) -> Result<PakFile> {
             0
         };
 
-        if data_size > 0 && data_size < 10_000_000 {
-            let mut data = vec![0u8; data_size];
-            file.seek(SeekFrom::Start(offset as u64))?;
-            if file.read_exact(&mut data).is_ok() {
-                let mut resource = Resource {
-                    id,
-                    offset,
-                    data,
-                    width: None,
-                    height: None,
-                    format: None,
-                };
-                let _ = resource.parse_image_dimensions();
-                resource_vec.push(resource);
-            }
+        if data_size > 10_000_000 {
+            continue;
         }
+
+        let data = if data_size > 0 {
+            let mut buf = vec![0u8; data_size];
+            file.seek(SeekFrom::Start(offset as u64))?;
+            if file.read_exact(&mut buf).is_err() {
+                continue;
+            }
+            buf
+        } else {
+            Vec::new()
+        };
+
+        let mut resource = Resource {
+            id,
+            offset,
+            data,
+            width: None,
+            height: None,
+            format: None,
+        };
+        let _ = resource.parse_image_dimensions();
+        resource_vec.push(resource);
     }
 
     Ok(PakFile {

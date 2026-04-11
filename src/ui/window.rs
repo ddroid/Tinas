@@ -25,6 +25,7 @@ struct PakTab {
     editor_canvas: Rc<EditorCanvas>,
     tool_panel: Rc<ToolPanel>,
     current_resource_id: RefCell<Option<u16>>,
+    has_saved_changes: RefCell<bool>, // true once any resource has been saved to in-memory pak
 }
 
 pub struct MainWindow {
@@ -289,8 +290,12 @@ impl MainWindow {
     }
 
     fn maybe_store_active_resource_draft(&self, tab: &PakTab, resource_id: u16, action: &str) {
-        if *tab.current_resource_id.borrow() == Some(resource_id) && tab.editor_canvas.has_changes() {
-            self.store_current_draft(tab, action);
+        // Store draft for the currently loaded resource regardless of whether it has changes,
+        // so version history always reflects the latest canvas state.
+        if *tab.current_resource_id.borrow() == Some(resource_id) {
+            if tab.editor_canvas.has_changes() {
+                self.store_current_draft(tab, action);
+            }
         }
     }
 
@@ -312,17 +317,27 @@ impl MainWindow {
     }
 
     fn save_current_resource(&self, tab: &PakTab) -> bool {
-        if let Some(resource_id) = *tab.current_resource_id.borrow() {
-            if let Some(image) = tab.editor_canvas.get_composite_image() {
+        println!("[SAVE] save_current_resource called");
+        let resource_id = *tab.current_resource_id.borrow();
+        println!("[SAVE] current_resource_id={:?}", resource_id);
+        if let Some(resource_id) = resource_id {
+            let composite = tab.editor_canvas.get_composite_image();
+            println!("[SAVE] get_composite_image returned Some={}", composite.is_some());
+            if let Some(image) = composite {
                 match encode_png(&image, 6) {
                     Ok(png_data) => {
                         let pak_key = Self::pak_key_for_tab(tab);
-                        // Update the pak file
+                        println!("[SAVE] encoding OK, {} bytes, pak_key='{}'", png_data.len(), pak_key);
                         let mut pak = tab.pak_file.borrow_mut();
-                        if let Err(e) = pak.replace_resource(resource_id, png_data.clone()) {
-                            self.show_error_dialog("Save Error", &format!("Failed to update resource: {}", e));
-                            return false;
+                        match pak.replace_resource(resource_id, png_data.clone()) {
+                            Ok(_) => println!("[SAVE] replace_resource OK"),
+                            Err(e) => {
+                                println!("[SAVE] replace_resource FAILED: {}", e);
+                                self.show_error_dialog("Save Error", &format!("Failed to update resource: {}", e));
+                                return false;
+                            }
                         }
+                        drop(pak);
 
                         self.temp_db.borrow_mut().add_version(
                             &pak_key,
@@ -331,51 +346,108 @@ impl MainWindow {
                             png_data,
                         );
                         self.temp_db.borrow_mut().mark_saved(&pak_key, resource_id);
+                        println!("[SAVE] version added and marked saved");
 
-                        // Clear changes flag
-                        tab.editor_canvas.clear_changes();
+                        tab.editor_canvas.mark_saved();
+                        *tab.has_saved_changes.borrow_mut() = true;
+                        println!("[SAVE] has_saved_changes=true, calling update_toolbar_buttons");
                         self.update_toolbar_buttons(tab);
                         self.status_bar.push(0, &format!("Saved changes to resource {}", resource_id));
                         return true;
                     }
                     Err(e) => {
+                        println!("[SAVE] encode_png FAILED: {}", e);
                         self.show_error_dialog("Export Error", &format!("Failed to encode PNG: {}", e));
                         return false;
                     }
                 }
+            } else {
+                println!("[SAVE] ABORT: get_composite_image returned None (no image loaded?)");
             }
+        } else {
+            println!("[SAVE] ABORT: no current_resource_id (no resource selected)");
         }
 
         false
     }
 
     fn export_to_brave(&self, tab: &PakTab) {
+        println!("[EXPORT] export_to_brave called, has_changes={} has_saved={}",
+            tab.editor_canvas.has_changes(), *tab.has_saved_changes.borrow());
         if tab.editor_canvas.has_changes() && !self.save_current_resource(tab) {
+            println!("[EXPORT] aborted: save_current_resource returned false");
             return;
         }
 
-        // Then write the pak file back to the original path
         let pak = tab.pak_file.borrow();
-        match pak.save(&tab.path) {
+        let target = &tab.path;
+
+        // Try direct write first
+        match pak.save(target) {
             Ok(_) => {
-                self.status_bar.push(0, &format!("Exported to Brave: {}", tab.path.display()));
+                println!("[EXPORT] direct write OK");
+                self.status_bar.push(0, &format!("Exported to Brave: {}", target.display()));
+                return;
             }
             Err(e) => {
-                self.show_error_dialog("Export Error", &format!("Failed to write pak file: {}", e));
+                println!("[EXPORT] direct write failed: {}, trying pkexec", e);
+            }
+        }
+
+        // Direct write failed (likely permission denied). Save to temp, then pkexec cp.
+        let temp_path = std::env::temp_dir().join("pak_export_temp.pak");
+        if let Err(e) = pak.save(&temp_path) {
+            println!("[EXPORT] temp write failed: {}", e);
+            self.show_error_dialog("Export Error", &format!("Failed to write temp pak file: {}", e));
+            return;
+        }
+        println!("[EXPORT] temp write OK: {}", temp_path.display());
+
+        let target_str = target.to_string_lossy().to_string();
+        let temp_str = temp_path.to_string_lossy().to_string();
+
+        match std::process::Command::new("pkexec")
+            .args(&["cp", &temp_str, &target_str])
+            .status()
+        {
+            Ok(status) if status.success() => {
+                println!("[EXPORT] pkexec cp succeeded");
+                let _ = std::fs::remove_file(&temp_path);
+                self.status_bar.push(0, &format!("Exported to Brave: {}", target.display()));
+            }
+            Ok(status) => {
+                println!("[EXPORT] pkexec cp failed with status: {}", status);
+                let _ = std::fs::remove_file(&temp_path);
+                self.show_error_dialog("Export Error",
+                    &format!("Failed to write pak file (elevated copy failed, status {}).\nTarget: {}", status, target.display()));
+            }
+            Err(e) => {
+                println!("[EXPORT] pkexec failed: {}", e);
+                let _ = std::fs::remove_file(&temp_path);
+                self.show_error_dialog("Export Error",
+                    &format!("Failed to elevate permissions: {}\nTarget: {}", e, target.display()));
             }
         }
     }
 
     fn update_toolbar_buttons(&self, tab: &PakTab) {
         let has_changes = tab.editor_canvas.has_changes();
+        let has_saved = *tab.has_saved_changes.borrow();
         let can_undo = tab.editor_canvas.can_undo();
         let can_redo = tab.editor_canvas.can_redo();
+        println!("[TOOLBAR] update: has_changes={} has_saved={} can_undo={} can_redo={}", has_changes, has_saved, can_undo, can_redo);
 
         if let Some(ref save_btn) = *self.save_btn.borrow() {
             save_btn.set_sensitive(has_changes);
+            println!("[TOOLBAR] save_btn sensitive={}", has_changes);
+        } else {
+            println!("[TOOLBAR] WARNING: save_btn is None");
         }
         if let Some(ref export_btn) = *self.export_btn.borrow() {
-            export_btn.set_sensitive(has_changes);
+            export_btn.set_sensitive(has_saved);
+            println!("[TOOLBAR] export_btn sensitive={}", has_saved);
+        } else {
+            println!("[TOOLBAR] WARNING: export_btn is None");
         }
         if let Some(ref undo_btn) = *self.undo_btn.borrow() {
             undo_btn.set_sensitive(can_undo);
@@ -550,6 +622,24 @@ impl MainWindow {
         let tool_panel = Rc::new(ToolPanel::new());
         tool_panel.set_editor_canvas(Rc::clone(&editor_canvas));
 
+        // Register the on_changed callback once at tab creation, keyed to this page_num.
+        // Do NOT re-register it on every resource select (that would create stale closures).
+        let this_weak_for_cb = self.self_weak.borrow().clone();
+        let page_num_for_cb_early = *self.tab_counter.borrow();
+        editor_canvas.set_on_changed_callback(move |has_changes| {
+            println!("[TOOLBAR CB] on_changed fired: has_changes={} for page_num={}", has_changes, page_num_for_cb_early);
+            if let Some(this) = this_weak_for_cb.upgrade() {
+                let tabs = this.tabs.borrow();
+                if let Some(tab) = tabs.get(&page_num_for_cb_early) {
+                    this.update_toolbar_buttons(tab);
+                } else {
+                    println!("[TOOLBAR CB] ERROR: no tab found for page_num={}", page_num_for_cb_early);
+                }
+            } else {
+                println!("[TOOLBAR CB] ERROR: window was dropped");
+            }
+        });
+
         // Create a 3-pane layout: resource list | editor | tool panel
         let main_paned = Paned::new(Orientation::Horizontal);
         main_paned.set_wide_handle(true);
@@ -584,6 +674,7 @@ impl MainWindow {
             editor_canvas: Rc::clone(&editor_canvas),
             tool_panel: Rc::clone(&tool_panel),
             current_resource_id: RefCell::new(None),
+            has_saved_changes: RefCell::new(false),
         };
 
         self.tabs.borrow_mut().insert(page_num, tab);
@@ -627,19 +718,8 @@ impl MainWindow {
                                     canvas.set_base_image(&img);
                                     println!("[DEBUG] Image set to canvas");
 
-                                    let this_weak2 = this_weak.clone();
-                                    canvas.set_on_changed_callback(move |has_changes| {
-                                        println!("[DEBUG] Changes state: {}", has_changes);
-                                        if let Some(this) = this_weak2.upgrade() {
-                                            let current_page = this.notebook.current_page();
-                                            if let Some(page_num) = current_page {
-                                                let tabs = this.tabs.borrow();
-                                                if let Some(tab) = tabs.get(&page_num) {
-                                                    this.update_toolbar_buttons(tab);
-                                                }
-                                            }
-                                        }
-                                    });
+                                    // Update toolbar immediately to reflect the cleared has_changes state.
+                                    this.update_toolbar_buttons(tab);
                                 }
                                 Err(e) => {
                                     eprintln!("[DEBUG] Failed to load image: {}", e);
