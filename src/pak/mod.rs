@@ -162,3 +162,43 @@ fn decode_image(data: &[u8]) -> Result<DynamicImage> {
         _ => anyhow::bail!("Unsupported image format"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn roundtrip_brave_pak() {
+        let input = Path::new("/tmp/brave_original.pak");
+        if !input.exists() {
+            eprintln!("Skipping roundtrip test: /tmp/brave_original.pak not found");
+            return;
+        }
+        let output = Path::new("/tmp/brave_roundtrip.pak");
+
+        let pak = PakFile::load(input).expect("Failed to load");
+        eprintln!("Loaded: {} resources, {} aliases, version={}", pak.resources.len(), pak.aliases.len(), pak.version);
+
+        pak.save(output).expect("Failed to save");
+
+        let size_in = std::fs::metadata(input).unwrap().len();
+        let size_out = std::fs::metadata(output).unwrap().len();
+        eprintln!("Input size:  {}", size_in);
+        eprintln!("Output size: {}", size_out);
+
+        assert_eq!(size_in, size_out, "Roundtrip file size mismatch");
+
+        // Compare bytes
+        let bytes_in = std::fs::read(input).unwrap();
+        let bytes_out = std::fs::read(output).unwrap();
+        if bytes_in != bytes_out {
+            // Find first difference
+            for (i, (a, b)) in bytes_in.iter().zip(bytes_out.iter()).enumerate() {
+                if a != b {
+                    panic!("First byte difference at offset {}: original=0x{:02x} written=0x{:02x}", i, a, b);
+                }
+            }
+        }
+    }
+}
