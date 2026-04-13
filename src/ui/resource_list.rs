@@ -28,9 +28,13 @@ impl ResourceList {
         let container = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .min_content_width(200)
+            .max_content_width(216)
+            .propagate_natural_width(true)
             .child(&list_box)
             .width_request(200)
             .build();
+        container.set_hexpand(false);
         
         let this = Self {
             container,
@@ -41,6 +45,19 @@ impl ResourceList {
             on_open_external: Rc::new(RefCell::new(None)),
             on_version_history: Rc::new(RefCell::new(None)),
         };
+        
+        // CSS for hiding/showing the three-dot menu
+        let provider = gtk4::CssProvider::new();
+        let css = "
+            row menubutton { opacity: 0; transition: opacity 100ms; }
+            row:hover menubutton, row:selected menubutton, row:focus menubutton { opacity: 1; }
+        ";
+        provider.load_from_data(css);
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().unwrap(),
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
         
         this.setup_signals();
         this.setup_right_click();

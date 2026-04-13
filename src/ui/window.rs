@@ -27,7 +27,8 @@ struct PakTab {
     current_resource_id: RefCell<Option<u16>>,
     has_saved_changes: RefCell<bool>, // true once any resource has been saved to in-memory pak
     main_paned: Paned,
-    right_paned: Paned,
+    right_paned: Paned,      // editor | full-tool-panel
+    right_mini_paned: Paned, // (editor|full) | mini-tool-panel
 }
 
 pub struct MainWindow {
@@ -98,26 +99,17 @@ impl MainWindow {
         notebook.set_vexpand(true);
         notebook.set_scrollable(true);
 
-        // Container: [collapse-left] [notebook] [collapse-right]
-        let tabs_row = Box::new(Orientation::Horizontal, 0);
-        tabs_row.set_vexpand(true);
-
         let collapse_left_btn = Button::from_icon_name("sidebar-show-symbolic");
         collapse_left_btn.set_tooltip_text(Some("Toggle Left Sidebar"));
-        collapse_left_btn.set_valign(gtk4::Align::Start);
         collapse_left_btn.set_has_frame(false);
-        tabs_row.append(&collapse_left_btn);
-
-        tabs_row.append(&notebook);
-        notebook.set_hexpand(true);
+        notebook.set_action_widget(&collapse_left_btn, gtk4::PackType::Start);
 
         let collapse_right_btn = Button::from_icon_name("sidebar-show-right-symbolic");
         collapse_right_btn.set_tooltip_text(Some("Toggle Right Sidebar"));
-        collapse_right_btn.set_valign(gtk4::Align::Start);
         collapse_right_btn.set_has_frame(false);
-        tabs_row.append(&collapse_right_btn);
+        notebook.set_action_widget(&collapse_right_btn, gtk4::PackType::End);
 
-        main_box.append(&tabs_row);
+        main_box.append(&notebook);
 
         // Keep refs for connecting signals later
         let collapse_left_btn_ref = collapse_left_btn;
@@ -143,19 +135,10 @@ impl MainWindow {
         bottom_toolbar.append(&redo_btn);
         bottom_toolbar.append(&Separator::new(Orientation::Vertical));
 
-        // Tool size indicator
-        let size_label = Label::new(Some("Tool Size: 8px"));
-        bottom_toolbar.append(&size_label);
-
-        bottom_toolbar.append(&Separator::new(Orientation::Vertical));
-
-        // Status label
-        let status_label = Label::new(Some("No changes"));
-        status_label.set_hexpand(true);
-        status_label.set_halign(gtk4::Align::Start);
-        bottom_toolbar.append(&status_label);
-
-        bottom_toolbar.append(&Separator::new(Orientation::Vertical));
+        // Spacer to push zoom controls to the right
+        let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        bottom_toolbar.append(&spacer);
 
         // Zoom controls
         let zoom_label = Label::new(Some("100%"));
@@ -226,7 +209,7 @@ impl MainWindow {
                             if pos > 10 {
                                 tab.main_paned.set_position(0);
                             } else {
-                                tab.main_paned.set_position(250);
+                                tab.main_paned.set_position(200);
                             }
                         }
                     }
@@ -240,14 +223,29 @@ impl MainWindow {
                     if let Some(page_num) = this.notebook.current_page() {
                         let tabs = this.tabs.borrow();
                         if let Some(tab) = tabs.get(&page_num) {
-                            let total_w = tab.right_paned.width();
-                            let pos = tab.right_paned.position();
-                            if total_w - pos < 50 {
-                                // Currently collapsed, restore
-                                tab.right_paned.set_position(total_w - 200);
+                            // State detection (measured on right_mini_paned):
+                            //   mini_pos ≈ total_mini_w  → both panels hidden → open full
+                            //   right_pos ≈ total_right_w (full hidden) → show mini
+                            //   right_pos < total_right_w (full visible)  → hide full, show mini
+                            let total_mini  = tab.right_mini_paned.width();
+                            let total_right = tab.right_paned.width();
+                            let mini_pos    = tab.right_mini_paned.position();
+                            let right_pos   = tab.right_paned.position();
+
+                            let full_visible = total_right > 0 && (total_right - right_pos) >= 20;
+                            let mini_visible = total_mini  > 0 && (total_mini  - mini_pos)  >= 10;
+
+                            if full_visible {
+                                // State A → B: close full, open mini (56px)
+                                tab.right_paned.set_position(total_right);
+                                tab.right_mini_paned.set_position(total_mini.saturating_sub(56));
+                            } else if mini_visible {
+                                // State B → C: close mini too
+                                tab.right_mini_paned.set_position(total_mini);
                             } else {
-                                // Collapse: push position to full width
-                                tab.right_paned.set_position(total_w);
+                                // State C → A: reopen full (216px), hide mini strip
+                                tab.right_paned.set_position(total_right.saturating_sub(216));
+                                tab.right_mini_paned.set_position(total_mini);
                             }
                         }
                     }
@@ -824,21 +822,35 @@ impl MainWindow {
             }
         });
 
-        // Create a 3-pane layout: resource list | editor | tool panel
+        // Layout: resource_list | editor | full_tool | mini_tool
+        // Achieved with two nested Paneds:
+        //   right_paned      = editor | widget_full
+        //   right_mini_paned = right_paned | widget_mini
+        //   main_paned       = resource_list | right_mini_paned
+        //
+        // Toggle logic (collapse_right_btn):
+        //   State A (default): full panel open, mini hidden
+        //     right_paned.position = total - 200, right_mini_paned.position = all
+        //   State B: full closed, mini open
+        //     right_paned.position = total, right_mini_paned.position = total - 48
+        //   State C: mini closed too → back to State A
+
         let main_paned = Paned::new(Orientation::Horizontal);
         main_paned.set_wide_handle(true);
         main_paned.set_vexpand(true);
-        main_paned.set_position(250);
 
-        // Right side: editor + tool panel
         let right_paned = Paned::new(Orientation::Horizontal);
         right_paned.set_wide_handle(true);
-        right_paned.set_position(800);
         right_paned.set_start_child(Some(editor_canvas.widget()));
-        right_paned.set_end_child(Some(tool_panel.widget()));
+        right_paned.set_end_child(Some(tool_panel.widget_full()));
+
+        let right_mini_paned = Paned::new(Orientation::Horizontal);
+        right_mini_paned.set_wide_handle(true);
+        right_mini_paned.set_start_child(Some(&right_paned));
+        right_mini_paned.set_end_child(Some(tool_panel.widget_mini()));
 
         main_paned.set_start_child(Some(resource_list.widget()));
-        main_paned.set_end_child(Some(&right_paned));
+        main_paned.set_end_child(Some(&right_mini_paned));
 
         let tab_box = Box::new(Orientation::Horizontal, 4);
         let label = Label::new(Some(&tab_name));
@@ -861,6 +873,7 @@ impl MainWindow {
             has_saved_changes: RefCell::new(false),
             main_paned: main_paned.clone(),
             right_paned: right_paned.clone(),
+            right_mini_paned: right_mini_paned.clone(),
         };
 
         self.tabs.borrow_mut().insert(page_num, tab);
